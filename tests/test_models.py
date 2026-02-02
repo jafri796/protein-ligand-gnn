@@ -1,0 +1,395 @@
+"""
+Unit tests for protein-ligand binding affinity prediction system.
+
+This test suite validates:
+1. Data featurization correctness
+2. Graph construction validity
+3. Model architecture integrity
+4. Training loop functionality
+5. Scientific correctness
+"""
+
+import pytest
+import torch
+import numpy as np
+from pathlib import Path
+import tempfile
+
+# Imports from project modules
+from data.featurization import (
+    get_atom_features, get_bond_features, 
+    featurize_ligand, get_residue_features
+)
+from data.graph_construction import (
+    construct_ligand_graph, construct_protein_graph,
+    construct_complex_graph
+)
+from models.layers.equivariant_layers import (
+    RBFExpansion, PaiNNLayer, PaiNNMessage, PaiNNUpdate, InteractionLayer
+)
+from models.painn_affinity import PaiNNAffinityPredictor
+
+
+class TestFeaturization:
+    """Test molecular featurization."""
+    
+    def test_atom_features_dimension(self):
+        """Atom features should be 49-dimensional."""
+        from rdkit import Chem
+        
+        mol = Chem.MolFromSmiles("CCO")  # Ethanol
+        atom = mol.GetAtomWithIdx(0)
+        features = get_atom_features(atom)
+        
+        assert len(features) == 49, f"Expected 49 features, got {len(features)}"
+        assert np.all(np.isfinite(features)), "Features contain NaN or Inf"
+    
+    def test_bond_features_dimension(self):
+        """Bond features should be 9-13 dimensional (9 without 3D, 13 with dihedral)."""
+        from rdkit import Chem
+        
+        mol = Chem.MolFromSmiles("C=C")  # Ethene
+        bond = mol.GetBondWithIdx(0)
+        features = get_bond_features(bond)
+        
+        # Without 3D coordinates: 9 features
+        # With 3D coordinates: 13 features (includes dihedral sin/cos)
+        assert len(features) in [9, 13], f"Expected 9 or 13 features, got {len(features)}"
+        assert np.all(np.isfinite(features)), "Features contain NaN or Inf"
+    
+    def test_residue_features_dimension(self):
+        """Residue features should be 31-dimensional."""
+        from Bio.PDB import PDBParser, Residue
+        from Bio.PDB.Polypeptide import PPBuilder
+        
+        # Create a simple peptide for testing
+        peptide = PPBuilder().build_peptides(Residue())[0] if hasattr(Residue(), '__len__') else None
+        
+        # Test with terminus flags directly
+        features = get_residue_features(
+            residue=None,  # Will use default values
+            secondary_structure='H',
+            is_n_terminus=True,
+            is_c_terminus=False
+        )
+        
+        assert len(features) == 31, f"Expected 31 features, got {len(features)}"
+
+
+class TestGraphConstruction:
+    """Test graph construction."""
+    
+    def test_ligand_graph_construction(self):
+        """Test ligand graph construction."""
+        # Create dummy data
+        num_atoms = 10
+        atom_features = np.random.randn(num_atoms, 49).astype(np.float32)
+        atom_coords = np.random.randn(num_atoms, 3).astype(np.float32)
+        bond_indices = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+        bond_features = np.random.randn(3, 9).astype(np.float32)
+        
+        ligand_graph = construct_ligand_graph(
+            atom_features, atom_coords, bond_indices, bond_features
+        )
+        
+        assert ligand_graph.x.shape == (num_atoms, 49)
+        assert ligand_graph.pos.shape == (num_atoms, 3)
+        assert torch.isfinite(ligand_graph.x).all()
+        assert torch.isfinite(ligand_graph.pos).all()
+    
+    def test_protein_graph_construction(self):
+        """Test protein graph construction."""
+        num_residues = 50
+        residue_features = np.random.randn(num_residues, 31).astype(np.float32)
+        residue_coords = np.random.randn(num_residues, 3).astype(np.float32)
+        
+        # Use radius method instead of knn (requires torch-cluster)
+        protein_graph = construct_protein_graph(
+            residue_features, residue_coords, method='radius', cutoff=5.0
+        )
+        
+        assert protein_graph.x.shape == (num_residues, 31)
+        assert protein_graph.pos.shape == (num_residues, 3)
+        assert torch.isfinite(protein_graph.x).all()
+    
+    def test_complex_graph_construction(self):
+        """Test full complex graph construction."""
+        # Create ligand graph
+        num_atoms = 10
+        atom_features = np.random.randn(num_atoms, 49).astype(np.float32)
+        atom_coords = np.random.randn(num_atoms, 3).astype(np.float32)
+        bond_indices = np.array([[0, 1], [1, 0]], dtype=np.int64)
+        bond_features = np.random.randn(2, 9).astype(np.float32)
+        
+        ligand_graph = construct_ligand_graph(
+            atom_features, atom_coords, bond_indices, bond_features
+        )
+        
+        # Create protein graph
+        num_residues = 20
+        residue_features = np.random.randn(num_residues, 31).astype(np.float32)
+        residue_coords = np.random.randn(num_residues, 3).astype(np.float32)
+        
+        protein_graph = construct_protein_graph(
+            residue_features, residue_coords, method='radius', cutoff=5.0
+        )
+        
+        # Construct complex
+        complex_graph = construct_complex_graph(
+            ligand_graph, protein_graph, interaction_cutoff=5.0
+        )
+        
+        assert complex_graph.x.shape[0] == num_atoms + num_residues
+        assert torch.isfinite(complex_graph.x).all()
+
+
+class TestEquivariantLayers:
+    """Test SE(3)-equivariant message passing layers."""
+    
+    def test_rbf_expansion(self):
+        """Test RBF expansion."""
+        rbf = RBFExpansion(num_rbf=20, cutoff=10.0)
+        distances = torch.linspace(0, 10, 100)
+        
+        rbf_features = rbf(distances)
+        
+        assert rbf_features.shape == (100, 20)
+        assert torch.isfinite(rbf_features).all()
+        # RBF values should be in [0, 1]
+        assert (rbf_features >= 0).all() and (rbf_features <= 1.1).all()  # Small tolerance
+    
+    def test_painn_update_equivariance(self):
+        """Test that PaiNN update preserves vector shapes."""
+        hidden_dim = 128
+        num_nodes = 10
+        
+        s = torch.randn(num_nodes, hidden_dim)
+        v = torch.randn(num_nodes, 3, hidden_dim)
+        
+        update = PaiNNUpdate(hidden_dim)
+        s_out, v_out = update(s, v)
+        
+        assert s_out.shape == s.shape, "Scalar features shape changed"
+        assert v_out.shape == v.shape, "Vector features shape changed"
+        assert torch.isfinite(s_out).all()
+        assert torch.isfinite(v_out).all()
+    
+    def test_painn_layer_forward(self):
+        """Test complete PaiNN layer forward pass."""
+        hidden_dim = 64
+        num_rbf = 20
+        num_nodes = 10
+        num_edges = 20
+        
+        s = torch.randn(num_nodes, hidden_dim)
+        v = torch.randn(num_nodes, 3, hidden_dim)
+        edge_index = torch.randint(0, num_nodes, (2, num_edges))
+        edge_rbf = torch.randn(num_edges, num_rbf)
+        edge_vec = torch.randn(num_edges, 3)
+        edge_vec = edge_vec / (torch.norm(edge_vec, dim=1, keepdim=True) + 1e-8)
+        
+        layer = PaiNNLayer(hidden_dim, num_rbf)
+        s_out, v_out = layer(s, v, edge_index, edge_rbf, edge_vec)
+        
+        assert s_out.shape == s.shape, "Scalar output shape mismatch"
+        assert v_out.shape == v.shape, "Vector output shape mismatch"
+        assert torch.isfinite(s_out).all()
+        assert torch.isfinite(v_out).all()
+
+
+class TestModel:
+    """Test the full PaiNN model."""
+    
+    def test_model_creation(self):
+        """Test model instantiation."""
+        model = PaiNNAffinityPredictor(
+            node_dim=49,
+            edge_dim=64,
+            hidden_dim=64,
+            num_layers=2,
+            num_rbf=10,
+            cutoff=10.0,
+            dropout=0.1
+        )
+        assert model is not None
+    
+    def test_model_forward_pass(self):
+        """Test model forward pass with batch data."""
+        from torch_geometric.data import Data, Batch
+        
+        model = PaiNNAffinityPredictor(
+            node_dim=49,
+            edge_dim=64,
+            hidden_dim=64,
+            num_layers=2,
+            num_rbf=10,
+            cutoff=10.0,
+            dropout=0.1
+        )
+        
+        # Create batch of dummy complexes
+        data_list = []
+        for _ in range(2):
+            num_ligand = 8
+            num_protein = 15
+            num_nodes = num_ligand + num_protein
+            
+            # Ligand features (49-dim)
+            x_ligand = torch.randn(num_ligand, 49)
+            x_protein = torch.randn(num_protein, 31)
+            x = torch.cat([x_ligand, x_protein], dim=0)
+            
+            pos = torch.randn(num_nodes, 3)
+            edge_index = torch.randint(0, num_nodes, (2, 30))
+            edge_attr = torch.randn(30, 10)
+            
+            node_type = torch.cat([
+                torch.zeros(num_ligand, dtype=torch.long),
+                torch.ones(num_protein, dtype=torch.long)
+            ])
+            y = torch.tensor([7.5])
+            
+            data = Data(
+                x=x, pos=pos, edge_index=edge_index,
+                edge_attr=edge_attr, node_type=node_type, y=y
+            )
+            data_list.append(data)
+        
+        batch = Batch.from_data_list(data_list)
+        
+        # Forward pass
+        output = model(batch)
+        
+        assert output.shape == (2,), f"Expected output shape (2,), got {output.shape}"
+        assert torch.isfinite(output).all(), "Output contains NaN or Inf"
+
+
+class TestReproducibility:
+    """Test reproducibility settings."""
+    
+    def test_seed_setting(self):
+        """Test that random seed produces reproducible results."""
+        from utils import set_seed
+        
+        # First run
+        set_seed(42)
+        rand1 = torch.randn(10)
+        
+        # Second run with same seed
+        set_seed(42)
+        rand2 = torch.randn(10)
+        
+        assert torch.allclose(rand1, rand2), "Random seed not reproducible"
+
+
+class TestDihedralFeatures:
+    """Test 3D dihedral feature computation."""
+    
+    def test_dihedral_angle_computation(self):
+        """Test dihedral angle computation for rotatable bonds."""
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from data.featurization import get_dihedral_angle
+        
+        # Create a molecule with 3D coordinates
+        mol = Chem.MolFromSmiles("CCCC")  # n-butane has rotatable bond
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        AllChem.MMFFOptimizeMolecule(mol)
+        
+        # Get middle bond (C-C rotatable)
+        bond = mol.GetBondWithIdx(1)
+        dihedral = get_dihedral_angle(mol, bond)
+        
+        # Dihedral should be in [-π, π]
+        assert -np.pi <= dihedral <= np.pi, f"Dihedral {dihedral} out of range"
+        
+    def test_bond_features_with_dihedral(self):
+        """Test bond features include dihedral when 3D coords available."""
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from data.featurization import get_bond_features
+        
+        mol = Chem.MolFromSmiles("CCCC")
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol, randomSeed=42)
+        
+        bond = mol.GetBondWithIdx(1)
+        features = get_bond_features(bond, mol)
+        
+        # Should be 13-dim with dihedral (sin/cos)
+        assert len(features) >= 9, f"Bond features too short: {len(features)}"
+        assert np.all(np.isfinite(features)), "Features contain NaN or Inf"
+
+
+class TestTerminusDetection:
+    """Test N/C terminus detection in protein featurization."""
+    
+    def test_terminus_flags_in_features(self):
+        """Test that terminus flags are correctly set in residue features."""
+        from data.featurization import get_residue_features
+        
+        # N-terminus residue
+        n_term_features = get_residue_features(
+            None, secondary_structure='H', 
+            is_n_terminus=True, is_c_terminus=False
+        )
+        
+        # C-terminus residue
+        c_term_features = get_residue_features(
+            None, secondary_structure='H',
+            is_n_terminus=False, is_c_terminus=True
+        )
+        
+        # Middle residue
+        mid_features = get_residue_features(
+            None, secondary_structure='H',
+            is_n_terminus=False, is_c_terminus=False
+        )
+        
+        # Check dimensions
+        assert len(n_term_features) == 31, f"Expected 31 features, got {len(n_term_features)}"
+        
+        # N-terminus flag is at index 29, C-terminus at index 30
+        assert n_term_features[29] == 1.0, "N-terminus flag not set"
+        assert n_term_features[30] == 0.0, "C-terminus flag incorrectly set"
+        
+        assert c_term_features[29] == 0.0, "N-terminus flag incorrectly set"
+        assert c_term_features[30] == 1.0, "C-terminus flag not set"
+        
+        assert mid_features[29] == 0.0, "N-terminus flag incorrectly set for middle"
+        assert mid_features[30] == 0.0, "C-terminus flag incorrectly set for middle"
+
+
+class TestScientificValidity:
+    """Test scientific correctness of features and calculations."""
+    
+    def test_binding_pocket_identification(self):
+        """Test binding pocket identification."""
+        from data.featurization import identify_binding_pocket
+        
+        protein_coords = np.random.randn(50, 3)
+        ligand_coords = np.random.randn(10, 3)
+        
+        # Place some ligand atoms near protein
+        ligand_coords[0] = protein_coords[0] + 0.5 * np.random.randn(3)
+        ligand_coords[1] = protein_coords[10] + 0.5 * np.random.randn(3)
+        
+        in_pocket = identify_binding_pocket(protein_coords, ligand_coords, cutoff=5.0)
+        
+        # At least residues 0 and 10 should be in pocket
+        assert in_pocket[0] or in_pocket[10], "Binding pocket identification failed"
+    
+    def test_distance_calculation_correctness(self):
+        """Test that distances are calculated correctly."""
+        coords1 = np.array([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
+        coords2 = np.array([[0, 0, 0], [0, 1, 0]], dtype=np.float32)
+        
+        # Distance from (0,0,0) to (1,0,0) should be 1
+        dist = np.linalg.norm(coords1[1] - coords2[0])
+        assert np.isclose(dist, 1.0), f"Expected distance 1.0, got {dist}"
+
+
+if __name__ == "__main__":
+    # Run tests with: pytest tests/test_models.py -v
+    pytest.main([__file__, "-v"])

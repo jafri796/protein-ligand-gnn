@@ -1,0 +1,107 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "protein-ligand-gnn"
+version = "1.0.0"
+description = "Protein-Ligand Binding Affinity Prediction using SE(3)-Equivariant Graph Neural Networks"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+    {name = "jafri796"}
+]
+keywords = [
+    "machine-learning",
+    "deep-learning",
+    "drug-discovery",
+    "graph-neural-networks",
+    "pytorch",
+    "binding-affinity",
+    "protein-ligand",
+    "equivariant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Chemistry",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.1.0",
+    "torch-geometric>=2.4.0",
+    "rdkit>=2023.9.1",
+    "biopython>=1.81",
+    "numpy>=1.24.0",
+    "scipy>=1.10.0",
+    "pandas>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "pyyaml>=6.0",
+    "tensorboard>=2.14.0",
+    "tqdm>=4.66.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+hpo = [
+    "optuna>=3.0.0",
+]
+all = [
+    "protein-ligand-gnn[dev,hpo]",
+]
+
+[project.urls]
+Homepage = "https://github.com/jafri796/protein-ligand-gnn"
+Documentation = "https://github.com/jafri796/protein-ligand-gnn#readme"
+Repository = "https://github.com/jafri796/protein-ligand-gnn"
+Issues = "https://github.com/jafri796/protein-ligand-gnn/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data*", "models*", "utils*", "experiments*", "tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.black]
+line-length = 100
+target-version = ['py39', 'py310', 'py311']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+    | \.venv
+    | build
+    | dist
+    | __pycache__
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["data", "models", "utils", "experiments"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true

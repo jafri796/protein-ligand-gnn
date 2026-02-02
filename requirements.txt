@@ -1,0 +1,31 @@
+
+
+# Chemistry & Biology
+rdkit>=2023.9.1
+biopython>=1.81
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-learn>=1.3.0
+
+# Configuration & I/O
+pyyaml>=6.0
+
+# Logging & Monitoring
+tensorboard>=2.14.0
+tqdm>=4.66.0
+
+# Testing
+pytest>=7.0.0
+
+# Hyperparameter Optimization
+optuna>=3.0.0
+
+# Interpretability (optional)
+shap>=0.42.0
+matplotlib>=3.7.0
+
+# PyTorch Geometric clustering (for kNN graphs)
+torch-cluster>=1.6.0

@@ -1,0 +1,49 @@
+# PaiNN-Based Affinity Prediction Configuration
+
+model:
+  name: "painn_affinity"
+  hidden_dim: 128
+  num_message_passing_layers: 5
+  num_protein_layers: 3
+  num_rbf: 20
+  cutoff: 10.0
+  dropout: 0.1
+
+training:
+  batch_size: 32
+  num_epochs: 200
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  gradient_clip: 1.0
+  early_stopping_patience: 20
+  lr_scheduler:
+    type: "reduce_on_plateau"
+    factor: 0.5
+    patience: 10
+    min_lr: 0.000001
+
+data:
+  dataset: "pdbbind"
+  data_dir: "./data/pdbbind"
+  train_split: "splits/train.txt"
+  val_split: "splits/val.txt"
+  test_split: "splits/test.txt"
+  cache_dir: "./data/processed"
+  num_workers: 4
+  pin_memory: true
+  binding_pocket_only: true
+  pocket_cutoff: 10.0
+  interaction_cutoff: 5.0
+
+logging:
+  log_dir: "./outputs/logs"
+  checkpoint_dir: "./outputs/checkpoints"
+  save_every_n_epochs: 5
+  log_every_n_steps: 10
+  use_tensorboard: true
+  use_wandb: false
+
+reproducibility:
+  seed: 42
+  deterministic: true
+  cudnn_benchmark: false
