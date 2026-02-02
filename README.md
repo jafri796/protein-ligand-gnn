@@ -1,6 +1,6 @@
-#Protein-Ligand Binding Affinity Prediction
+Protein-Ligand Binding Affinity Prediction
 
-##Overview
+Overview
 This system implements state-of-the-art geometric deep learning for predicting protein-ligand binding affinities. Built on:
 
 PaiNN-inspired SE(3)-equivariant message passing
