@@ -1,8 +1,6 @@
-Protein-Ligand Binding Affinity Prediction
-Production-Grade Deep Learning System
-Complete, validated, research-ready codebase for PhD application
+#Protein-Ligand Binding Affinity Prediction
 
-Overview
+##Overview
 This system implements state-of-the-art geometric deep learning for predicting protein-ligand binding affinities. Built on:
 
 PaiNN-inspired SE(3)-equivariant message passing
