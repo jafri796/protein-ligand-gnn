@@ -5,11 +5,11 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
-A state-of-the-art deep learning system for predicting protein-ligand binding affinities using geometric deep learning and SE(3)-equivariant neural networks.
+A deep learning system for predicting protein-ligand binding affinities using geometric deep learning and SE(3)-equivariant neural networks.
 
 ## 🎯 Overview
 
-This system implements cutting-edge geometric deep learning techniques for accurate binding affinity prediction, built on:
+This system implements geometric deep learning techniques for accurate binding affinity prediction, built on:
 
 - **PaiNN-inspired SE(3)-equivariant message passing** for 3D molecular geometry
 - **Heterogeneous interaction graphs (IGN/GIGN)** for protein-ligand interactions
@@ -140,8 +140,6 @@ with torch.no_grad():
 
 ## 🧩 Module Descriptions
 
-### 1. `data/featurization.py` (472 lines)
-
 **Molecular Feature Extraction**
 
 - **Ligand Features**: RDKit-based atom features (49-dim) and bond features (10-dim)
@@ -158,8 +156,6 @@ with torch.no_grad():
 
 **Scientific Justification**: Features based on GraphDTA, IGN, and molecular ML best practices from recent literature.
 
-### 2. `data/graph_construction.py` (385 lines)
-
 **Heterogeneous Graph Construction**
 
 - **Ligand Graphs**: Covalent bond connectivity + self-loops
@@ -168,8 +164,6 @@ with torch.no_grad():
 - **RBF Expansion**: Gaussian radial basis functions for distance encoding
 
 **Scientific Justification**: Follows PyTorch Geometric conventions and IGN/GIGN heterogeneous graph design principles.
-
-### 3. `data/dataset.py` (251 lines)
 
 **Efficient Data Loading**
 
@@ -180,8 +174,6 @@ with torch.no_grad():
 
 **Engineering**: Production-quality with comprehensive error handling and logging.
 
-### 4. `models/layers/equivariant_layers.py` (378 lines)
-
 **SE(3)-Equivariant Layers**
 
 - **RBF Expansion Layer**: Gaussian basis function distance encoding
@@ -191,8 +183,6 @@ with torch.no_grad():
 
 **Scientific Justification**: Direct implementation of Schütt et al. (2021) PaiNN architecture.
 
-### 5. `models/painn_affinity.py` (287 lines)
-
 **Main Prediction Model**
 
 - **Ligand Encoder**: 5-layer PaiNN (scalar + vector features)
@@ -201,8 +191,6 @@ with torch.no_grad():
 - **Readout Head**: Global pooling + 4-layer MLP for affinity prediction
 
 **Architecture**: Synergizes PaiNN equivariance with IGN interaction modeling for superior performance.
-
-### 6. `experiments/train_painn.py` (309 lines)
 
 **Training Infrastructure**
 
@@ -256,18 +244,6 @@ python models/layers/equivariant_layers.py
 # Test complete model
 python models/painn_affinity.py
 ```
-
-## 📊 Performance Expectations
-
-Based on literature and architectural design:
-
-| Metric | Expected Performance | Source |
-|--------|---------------------|--------|
-| **RMSE** | 1.1 - 1.3 | PaiNN + interaction modeling |
-| **Pearson R** | 0.76 - 0.80 | IGN/GIGN benchmarks |
-| **MAE** | 0.9 - 1.1 | Comparable models |
-| **Parameters** | ~2-3M | Efficient architecture |
-| **Training Time** | 4-6 hours (V100) | Per 200 epochs |
 
 ## 📚 Scientific Foundation
 
@@ -339,14 +315,6 @@ Contributions are welcome! Please:
 ## 📄 License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 📬 Contact
-
-For questions, issues, or collaborations:
-
-- Open an issue on GitHub
-- Email: [your-email@domain.com]
-- Twitter: [@your-handle]
 
 ## 🙏 Acknowledgments
 
