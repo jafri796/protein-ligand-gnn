@@ -1,31 +1,75 @@
+# PyTorch Geometric Project - Requirements
+# Installation order matters! Install in groups as shown below.
 
+# ============================================================================
+# GROUP 1: Install PyTorch FIRST (choose your CUDA version)
+# ============================================================================
+# Visit: https://pytorch.org/get-started/locally/
+# 
+# For CUDA 11.8:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+#
+# For CUDA 12.1:
+# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#
+# For CPU only:
+# pip install torch torchvision torchaudio
+# ============================================================================
 
-# Chemistry & Biology
-rdkit>=2023.9.1
-biopython>=1.81
+torch>=2.0.0,<2.5.0
+torchvision>=0.15.0,<0.20.0
+torchaudio>=2.0.0,<2.5.0
 
-# Scientific Computing
-numpy>=1.24.0
-scipy>=1.10.0
-pandas>=2.0.0
-scikit-learn>=1.3.0
+# ============================================================================
+# GROUP 2: PyTorch Geometric Extensions (install AFTER PyTorch)
+# ============================================================================
+# Use pre-built wheels to avoid compilation errors
+# These will be installed from: https://data.pyg.org/whl/
+# ============================================================================
 
-# Configuration & I/O
-pyyaml>=6.0
+torch-geometric>=2.4.0,<2.6.0
+# Note: torch-scatter, torch-sparse, torch-cluster are now optional
+# PyTorch Geometric 2.4+ has built-in alternatives
 
-# Logging & Monitoring
-tensorboard>=2.14.0
-tqdm>=4.66.0
+# ============================================================================
+# GROUP 3: Chemistry & Biology
+# ============================================================================
 
-# Testing
-pytest>=7.0.0
+rdkit>=2023.9.1,<2024.10.0
+biopython>=1.81,<1.85.0
 
-# Hyperparameter Optimization
-optuna>=3.0.0
+# ============================================================================
+# GROUP 4: Scientific Computing
+# ============================================================================
 
-# Interpretability (optional)
-shap>=0.42.0
-matplotlib>=3.7.0
+numpy>=1.24.0,<2.0.0
+scipy>=1.10.0,<1.15.0
+pandas>=2.0.0,<2.3.0
+scikit-learn>=1.3.0,<1.6.0
 
-# PyTorch Geometric clustering (for kNN graphs)
-torch-cluster>=1.6.0
+# ============================================================================
+# GROUP 5: Utilities & Configuration
+# ============================================================================
+
+pyyaml>=6.0,<7.0
+tqdm>=4.66.0,<5.0.0
+
+# ============================================================================
+# GROUP 6: Monitoring & Visualization
+# ============================================================================
+
+tensorboard>=2.14.0,<3.0.0
+matplotlib>=3.7.0,<4.0.0
+
+# ============================================================================
+# GROUP 7: Machine Learning Tools
+# ============================================================================
+
+optuna>=3.0.0,<4.0.0
+shap>=0.42.0,<0.46.0
+
+# ============================================================================
+# GROUP 8: Testing
+# ============================================================================
+
+pytest>=7.0.0,<9.0.0

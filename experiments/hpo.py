@@ -20,7 +20,6 @@ import optuna
 from optuna.trial import Trial
 from optuna.samplers import TPESampler
 from optuna.pruners import MedianPruner
-import torch.utils.tensorboard as tb
 
 from data.dataset import ProteinLigandDataset
 from models.painn_affinity import PaiNNAffinityPredictor
@@ -30,7 +29,6 @@ PaiNNAffinity = PaiNNAffinityPredictor
 from utils import ConfigLoader, set_seed, validate_config
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 
 class PaiNNObjective:
@@ -108,7 +106,7 @@ class PaiNNObjective:
         patience_counter = 0
         max_patience = 3
         
-        for epoch in range(config['training']['max_epochs'] // 3):  # Reduce epochs for speed
+        for epoch in range(config['training']['num_epochs'] // 3):  # Reduce epochs for speed
             epoch_loss = 0.0
             num_batches = 0
             
@@ -186,11 +184,11 @@ class PaiNNObjective:
         config['training']['batch_size'] = trial.suggest_categorical(
             'batch_size', [16, 32, 64]
         )
-        config['training']['learning_rate'] = trial.suggest_loguniform(
-            'learning_rate', 1e-5, 1e-3
+        config['training']['learning_rate'] = trial.suggest_float(
+            'learning_rate', 1e-5, 1e-3, log=True
         )
-        config['training']['weight_decay'] = trial.suggest_loguniform(
-            'weight_decay', 1e-7, 1e-4
+        config['training']['weight_decay'] = trial.suggest_float(
+            'weight_decay', 1e-7, 1e-4, log=True
         )
         
         return config

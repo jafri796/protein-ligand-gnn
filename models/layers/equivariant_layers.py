@@ -80,16 +80,10 @@ class PaiNNMessage(MessagePassing):
         super().__init__(aggr='add')
         self.hidden_dim = hidden_dim
         
-        # Scalar message network
+        # Scalar message network: produces 3 * hidden_dim scalars
+        # Split into (ds, phi_vv, phi_sv) for scalar msg, vector scaling, direction scaling
         self.scalar_message_net = nn.Sequential(
             nn.Linear(hidden_dim * 2 + num_rbf, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim * 3)
-        )
-        
-        # Vector message networks
-        self.vector_message_net = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim * 3)
         )
@@ -122,26 +116,28 @@ class PaiNNMessage(MessagePassing):
         )
     
     def message(self, s_i, s_j, v_j, edge_rbf, edge_vec):
-        """Compute messages."""
-        # Scalar message
+        """Compute SE(3)-equivariant messages (Schütt et al. 2021).
+        
+        Equivariance proof:
+        - ds: derived from invariants (s_i, s_j, ||r_ij||) → invariant 
+        - phi_vv, phi_sv: derived from invariants → invariant scalars 
+        - phi_vv * v_j: invariant × equivariant → equivariant 
+        - phi_sv * edge_vec: invariant × equivariant → equivariant 
+        - dv = sum of equivariant terms → equivariant 
+        """
+        # Compute scalar filter from [s_i, s_j, RBF(d_ij)] — all invariant
         scalar_input = torch.cat([s_i, s_j, edge_rbf], dim=-1)
-        scalar_msg = self.scalar_message_net(scalar_input)
-        ds, dv_scale, dv_gate = torch.split(scalar_msg, self.hidden_dim, dim=-1)
+        scalar_out = self.scalar_message_net(scalar_input)  # (E, 3*H)
         
-        # Vector message (equivariant)
-        # Split vector features: v_j is (num_edges, 3, hidden_dim)
-        vector_msg = self.vector_message_net(v_j.transpose(1, 2))  # (E, hidden_dim, 3)
-        vector_msg = vector_msg.transpose(1, 2)  # (E, 3, hidden_dim)
+        # Split into scalar message, vector-vector scale, vector-direction scale
+        ds, phi_vv, phi_sv = torch.split(scalar_out, self.hidden_dim, dim=-1)
         
-        # Split into components
-        dv_msg1, dv_msg2, dv_msg3 = torch.split(vector_msg, self.hidden_dim // 3, dim=-1)
-        
-        # Combine with edge directions (maintains equivariance)
-        edge_vec_expanded = edge_vec.unsqueeze(-1)  # (E, 3, 1)
-        dv = dv_msg1 + dv_msg2 * edge_vec_expanded
-        
-        # Gate the vector message
-        dv = dv * dv_gate.unsqueeze(1)
+        # Vector message: channel-wise scaling of existing vectors + edge directions
+        # phi_vv: (E, H) → (E, 1, H) — scales each channel of v_j independently
+        # phi_sv: (E, H) → (E, 1, H) — scales edge_vec broadcast over channels
+        # edge_vec: (E, 3) → (E, 3, 1) — direction vector broadcast over channels
+        # No learned linear ever acts on the spatial dimension (3)
+        dv = phi_vv.unsqueeze(1) * v_j + phi_sv.unsqueeze(1) * edge_vec.unsqueeze(-1)
         
         return ds, dv
     
@@ -257,13 +253,18 @@ class PaiNNLayer(nn.Module):
 
 class InteractionLayer(MessagePassing):
     """
-    Interaction message passing layer for protein-ligand.
+    Vector-aware interaction message passing layer for protein-ligand.
     
-    Separate from intra-molecular layers, focuses on cross-molecular
-    interactions following IGN/GIGN approach.
+    Maintains SE(3) equivariance by incorporating vector features through
+    their norm (invariant scalar). This enables richer interactions while
+    preserving equivariance guarantees.
+    
+    Following the approach of:
+    - GIGN (Zhang et al., 2023)
+    - EquiBind (Stärk et al., 2022)
     """
     
-    def __init__(self, hidden_dim: int, num_heads: int = 4):
+    def __init__(self, hidden_dim: int, num_heads: int = 4, edge_dim: int = 14):
         super().__init__(aggr='add')
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -271,66 +272,87 @@ class InteractionLayer(MessagePassing):
         
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         
-        # Multi-head attention
+        # Multi-head attention for scalar features
         self.query = nn.Linear(hidden_dim, hidden_dim)
         self.key = nn.Linear(hidden_dim, hidden_dim)
         self.value = nn.Linear(hidden_dim, hidden_dim)
         
-        # Output projection
-        self.out_proj = nn.Linear(hidden_dim, hidden_dim)
+        # Vector feature projection (processes v_norm = ||v||)
+        self.vector_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim)
+        )
         
-        # Edge network
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim * 2, hidden_dim)  # *2 for scalar + vector-derived
+        
+        # Edge network - input dim depends on graph construction (padded edge_attr + edge type one-hot)
         self.edge_net = nn.Sequential(
-            nn.Linear(4, hidden_dim),  # distance + 3D direction
+            nn.Linear(edge_dim, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
     
     def forward(
         self,
-        x: torch.Tensor,
+        s: torch.Tensor,
+        v: torch.Tensor,
         edge_index: torch.Tensor,
         edge_attr: torch.Tensor
     ):
         """
         Args:
-            x: (num_nodes, hidden_dim) node features
+            s: (num_nodes, hidden_dim) scalar node features
+            v: (num_nodes, 3, hidden_dim) vector node features
             edge_index: (2, num_edges) edge connectivity
-            edge_attr: (num_edges, 4) edge features [dist, dx, dy, dz]
+            edge_attr: (num_edges, 7) edge features [dist, dx, dy, dz, edge_type_1hot]
             
         Returns:
-            Updated node features
+            Updated scalar features (equivariance preserved through v_norm)
         """
-        return self.propagate(edge_index, x=x, edge_attr=edge_attr)
-    
-    def message(self, x_i, x_j, edge_attr, index):
-        """Compute attention-based messages with proper normalization."""
-        # Multi-head attention projections
-        q = self.query(x_i).view(-1, self.num_heads, self.head_dim)  # (E, num_heads, head_dim)
-        k = self.key(x_j).view(-1, self.num_heads, self.head_dim)
-        v = self.value(x_j).view(-1, self.num_heads, self.head_dim)
+        # Compute vector norm (SE(3) invariant)
+        v_norm = v.norm(dim=1)  # (num_nodes, hidden_dim) - norm across spatial dimensions
         
-        # Attention scores from query-key interaction (scaled dot product)
-        attn_qk = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)  # (E, num_heads)
+        return self.propagate(edge_index, s=s, v_norm=v_norm, edge_attr=edge_attr)
+    
+    def message(self, s_i, s_j, v_norm_i, v_norm_j, edge_attr, index):
+        """Compute attention-based messages with vector-aware features."""
+        # Multi-head attention projections for scalars
+        q = self.query(s_i).view(-1, self.num_heads, self.head_dim)
+        k = self.key(s_j).view(-1, self.num_heads, self.head_dim)
+        v_val = self.value(s_j).view(-1, self.num_heads, self.head_dim)
+        
+        # Attention scores from query-key interaction
+        attn_qk = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)
+        
+        # Vector feature contribution (SE(3) invariant)
+        v_feat_i = self.vector_proj(v_norm_i)
+        v_feat_j = self.vector_proj(v_norm_j)
+        v_q = v_feat_i.view(-1, self.num_heads, self.head_dim)
+        v_k = v_feat_j.view(-1, self.num_heads, self.head_dim)
+        attn_v = (v_q * v_k).sum(dim=-1) / math.sqrt(self.head_dim)
         
         # Edge feature embedding
-        edge_emb = self.edge_net(edge_attr)  # (E, hidden_dim)
-        edge_emb = edge_emb.view(-1, self.num_heads, self.head_dim)  # (E, num_heads, head_dim)
+        edge_emb = self.edge_net(edge_attr)
+        edge_emb = edge_emb.view(-1, self.num_heads, self.head_dim)
         
-        # Edge feature contribution (properly scaled to avoid magnitude explosion)
-        edge_contrib = (edge_emb * q).sum(dim=-1) / math.sqrt(self.head_dim)  # (E, num_heads)
+        # Edge feature contribution
+        edge_contrib = (edge_emb * q).sum(dim=-1) / math.sqrt(self.head_dim)
         
-        # Combine with balanced weights (both contributions equally weighted)
-        attn = attn_qk + 0.5 * edge_contrib
+        # Combine all contributions
+        attn = attn_qk + 0.3 * attn_v + 0.3 * edge_contrib
         
-        # Softmax over edges arriving at each receiving node
-        attn = softmax(attn, index, dim=0)  # (E, num_heads)
+        # Softmax normalization
+        attn = softmax(attn, index, dim=0)
         
-        # Apply attention weights to values
-        attn_expanded = attn.unsqueeze(-1)  # (E, num_heads, 1)
-        out = (v * attn_expanded).view(-1, self.hidden_dim)  # (E, hidden_dim)
+        # Apply attention weights
+        attn_expanded = attn.unsqueeze(-1)
+        out = (v_val * attn_expanded).view(-1, self.hidden_dim)
         
-        return self.out_proj(out)
+        # Concatenate with vector-derived features for output
+        combined = torch.cat([out, v_feat_i], dim=-1)
+        return self.out_proj(combined)
 
 
 if __name__ == "__main__":
@@ -359,13 +381,14 @@ if __name__ == "__main__":
     
     print(f"✓ PaiNN layer: s {s_out.shape}, v {v_out.shape}")
     
-    # Test interaction layer
-    x = torch.randn(batch_size, hidden_dim)
-    edge_attr = torch.randn(20, 4)
+    # Test interaction layer (vector-aware)
+    s = torch.randn(batch_size, hidden_dim)
+    v = torch.randn(batch_size, 3, hidden_dim)
+    edge_attr = torch.randn(20, 7)  # 4 base features + 3 edge type indicators
     
     interaction_layer = InteractionLayer(hidden_dim, num_heads=4)
-    x_out = interaction_layer(x, edge_index, edge_attr)
+    s_out = interaction_layer(s, v, edge_index, edge_attr)
     
-    print(f"✓ Interaction layer: {x_out.shape}")
+    print(f"✓ Interaction layer: {s_out.shape}")
     
     print("\n✅ All layer tests passed!")

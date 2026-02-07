@@ -1,9 +1,9 @@
 """
 PaiNN-Based Binding Affinity Prediction Model
 
-Complete architecture integrating:
+Complete SE(3)-equivariant architecture:
 1. Equivariant ligand encoder (PaiNN layers)
-2. Protein encoder (GAT or simpler layers)
+2. Equivariant protein encoder (PaiNN layers) 
 3. Interaction modeling (cross-attention)
 4. Global pooling and readout
 """
@@ -11,7 +11,7 @@ Complete architecture integrating:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool, global_add_pool, GATConv
+from torch_geometric.nn import global_mean_pool, global_add_pool
 from typing import Dict, Optional
 
 from .layers.equivariant_layers import (
@@ -19,17 +19,25 @@ from .layers.equivariant_layers import (
     InteractionLayer,
     RBFExpansion
 )
+from data.featurization import (
+    LIGAND_ATOM_FEATURE_DIM,
+    LIGAND_BOND_FEATURE_DIM,
+    PROTEIN_RESIDUE_FEATURE_DIM
+)
 
 
 class PaiNNAffinityPredictor(nn.Module):
     """
-    Main model for binding affinity prediction.
+    SE(3)-equivariant binding affinity prediction model.
     
     Architecture:
-    - Ligand: PaiNN equivariant layers (5 layers)
-    - Protein: GAT layers (3 layers)
-    - Interaction: Cross-attention layer
+    - Ligand: PaiNN equivariant layers (scalar + vector features)
+    - Protein: PaiNN equivariant layers (scalar + vector features)
+    - Interaction: Cross-attention layer between ligand and protein
     - Readout: Global pooling + MLP → affinity (pKd)
+    
+    Both ligand and protein encoders are fully SE(3)-equivariant, ensuring
+    the model respects rotational and translational symmetries.
     
     Args:
         config: Configuration dictionary with hyperparameters
@@ -48,15 +56,17 @@ class PaiNNAffinityPredictor(nn.Module):
         self.dropout = config.get('dropout', 0.1)
         
         # Input dimensions (from featurization)
-        ligand_feat_dim = 49  # Atom features
-        protein_feat_dim = 31  # Residue features
+        # construct_complex_graph pads both to max(ligand, protein) dim
+        ligand_feat_dim = LIGAND_ATOM_FEATURE_DIM  # 49
+        protein_feat_dim = PROTEIN_RESIDUE_FEATURE_DIM  # 31
+        padded_feat_dim = max(ligand_feat_dim, protein_feat_dim)
         
         # RBF expansion for distances
         self.rbf = RBFExpansion(num_rbf=self.num_rbf, cutoff=self.cutoff)
         
         # ================== LIGAND ENCODER ==================
-        # Embedding
-        self.ligand_embedding_s = nn.Linear(ligand_feat_dim, self.hidden_dim)
+        # Embedding (input is padded_feat_dim after graph construction)
+        self.ligand_embedding_s = nn.Linear(padded_feat_dim, self.hidden_dim)
         # Vector features initialized to zero
         
         # PaiNN layers
@@ -66,25 +76,24 @@ class PaiNNAffinityPredictor(nn.Module):
         ])
         
         # ================== PROTEIN ENCODER ==================
-        # Embedding
-        self.protein_embedding = nn.Linear(protein_feat_dim, self.hidden_dim)
+        # Embedding (input is padded_feat_dim after graph construction)
+        self.protein_embedding_s = nn.Linear(padded_feat_dim, self.hidden_dim)
+        # Vector features initialized to zero (will be learned)
         
-        # GAT layers (simpler than PaiNN for efficiency)
+        # PaiNN layers for protein (SE(3)-equivariant)
         self.protein_layers = nn.ModuleList([
-            GATConv(
-                self.hidden_dim,
-                self.hidden_dim,
-                heads=4,
-                concat=False,
-                dropout=self.dropout
-            )
+            PaiNNLayer(self.hidden_dim, self.num_rbf)
             for _ in range(self.num_protein_layers)
         ])
         
         # ================== INTERACTION LAYER ==================
+        # edge_attr dim from construct_complex_graph:
+        #   max(ligand_bond_feat+1_dist, protein_4, inter_4) + 3_edge_type_onehot
+        interaction_edge_dim = LIGAND_BOND_FEATURE_DIM + 1 + 3  # bond_feats + dist + edge_type
         self.interaction_layer = InteractionLayer(
             self.hidden_dim,
-            num_heads=4
+            num_heads=4,
+            edge_dim=interaction_edge_dim
         )
         
         # ================== READOUT ==================
@@ -160,7 +169,12 @@ class PaiNNAffinityPredictor(nn.Module):
             )
         
         # ================== PROTEIN ENCODING ==================
-        h_protein = self.protein_embedding(batch.x[is_protein])
+        # Initialize scalar and vector features for protein
+        s_protein = self.protein_embedding_s(batch.x[is_protein])
+        v_protein = torch.zeros(
+            s_protein.size(0), 3, self.hidden_dim,
+            device=s_protein.device
+        )
         
         # Get protein edges
         protein_mask = is_protein[batch.edge_index[0]] & is_protein[batch.edge_index[1]]
@@ -171,10 +185,25 @@ class PaiNNAffinityPredictor(nn.Module):
         protein_idx_map[protein_idx] = torch.arange(len(protein_idx), device=batch.x.device)
         protein_edge_index_local = protein_idx_map[protein_edge_index]
         
-        # GAT message passing
-        for layer in self.protein_layers:
-            h_protein = layer(h_protein, protein_edge_index_local)
-            h_protein = F.relu(h_protein)
+        # Compute edge vectors and RBF for protein
+        if protein_edge_index.size(1) > 0:
+            row, col = protein_edge_index_local
+            prot_edge_vec = batch.pos[protein_edge_index[0]] - batch.pos[protein_edge_index[1]]
+            prot_edge_dist = torch.norm(prot_edge_vec, dim=1)
+            prot_edge_vec_norm = prot_edge_vec / (prot_edge_dist.unsqueeze(-1) + 1e-8)
+            prot_edge_rbf = self.rbf(prot_edge_dist)
+            
+            # PaiNN message passing for protein
+            for layer in self.protein_layers:
+                s_protein, v_protein = layer(
+                    s_protein, v_protein,
+                    protein_edge_index_local,
+                    prot_edge_rbf,
+                    prot_edge_vec_norm
+                )
+        
+        # Use scalar features for downstream tasks
+        h_protein = s_protein
         
         # ================== INTERACTION ==================
         # Get interaction edges
@@ -184,22 +213,27 @@ class PaiNNAffinityPredictor(nn.Module):
         inter_edge_attr = batch.edge_attr[inter_mask]
         
         if inter_edge_index.size(1) > 0:
-            # Combine ligand and protein features
-            # For ligand: use scalar features (invariant)
-            all_features = torch.zeros(batch.num_nodes, self.hidden_dim, device=batch.x.device)
-            all_features[ligand_idx] = s_ligand
-            all_features[protein_idx] = h_protein
+            # Combine ligand and protein features for vector-aware interaction
+            all_s = torch.zeros(batch.num_nodes, self.hidden_dim, device=batch.x.device)
+            all_s[ligand_idx] = s_ligand
+            all_s[protein_idx] = h_protein
             
-            # Apply interaction layer
-            interaction_features = self.interaction_layer(
-                all_features,
+            # Combine vector features
+            all_v = torch.zeros(batch.num_nodes, 3, self.hidden_dim, device=batch.x.device)
+            all_v[ligand_idx] = v_ligand
+            all_v[protein_idx] = v_protein
+            
+            # Apply vector-aware interaction layer
+            interaction_s = self.interaction_layer(
+                all_s,
+                all_v,
                 inter_edge_index,
                 inter_edge_attr
             )
             
             # Update features with interaction information
-            s_ligand = s_ligand + interaction_features[ligand_idx]
-            h_protein = h_protein + interaction_features[protein_idx]
+            s_ligand = s_ligand + interaction_s[ligand_idx]
+            h_protein = h_protein + interaction_s[protein_idx]
         
         # ================== GLOBAL POOLING ==================
         # Map back to batch indexing
@@ -224,11 +258,35 @@ class PaiNNAffinityPredictor(nn.Module):
     
     @staticmethod
     def from_config(config_path: str):
-        """Load model from config file."""
+        """Load model from config file.
+        
+        Args:
+            config_path: Path to YAML config file
+            
+        Returns:
+            PaiNNAffinityPredictor instance configured from file
+        """
         import yaml
+        from pathlib import Path
+        
+        config_path = Path(config_path)
+        if not config_path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+        
         with open(config_path, 'r') as f:
-            config = yaml.safe_load(f)
-        return PaiNNAffinityPredictor(config['model'])
+            full_config = yaml.safe_load(f)
+        
+        # Extract model config section
+        if 'model' in full_config:
+            model_config = full_config['model']
+        else:
+            # Assume entire config is model config
+            model_config = full_config
+        
+        # Create model
+        model = PaiNNAffinityPredictor(model_config)
+        
+        return model
 
 
 if __name__ == "__main__":
@@ -247,7 +305,7 @@ if __name__ == "__main__":
     model = PaiNNAffinityPredictor(config)
     print(f"✓ Model created with {model.get_num_params():,} parameters")
     
-    # Create dummy batch
+    # Create dummy batch with PROPER feature dimensions
     from torch_geometric.data import Data, Batch
     
     # Create two dummy complexes
@@ -257,17 +315,10 @@ if __name__ == "__main__":
         num_protein = 20
         num_nodes = num_ligand + num_protein
         
-        x = torch.randn(num_nodes, 49)  # Placeholder features
-        x[num_ligand:, :] = torch.randn(num_protein, 31)  # Different dim for protein
-        x = torch.cat([
-            torch.randn(num_ligand, 49),
-            torch.randn(num_protein, 31)
-        ], dim=0)
-        # Pad to same dimension
-        x = torch.cat([
-            F.pad(torch.randn(num_ligand, 49), (0, 31-49)),
-            torch.randn(num_protein, 31)
-        ], dim=0)
+        # Create features with correct dimensions
+        x_ligand = torch.randn(num_ligand, 49)  # Placeholder features
+        x_protein = torch.randn(num_protein, 31)  # Different dim for protein
+        x = torch.cat([x_ligand, x_protein], dim=0)
         
         pos = torch.randn(num_nodes, 3)
         edge_index = torch.randint(0, num_nodes, (2, 40))

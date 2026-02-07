@@ -12,7 +12,7 @@ These baselines establish performance bounds for the PaiNN model.
 import numpy as np
 import torch
 import torch.nn as nn
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List, Optional, Any
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.preprocessing import StandardScaler
@@ -33,7 +33,7 @@ class GraphDTAFeatureExtractor:
     classical ML models (RF, Linear Regression).
     """
     
-    def extract_features(self, graph_data) -> np.ndarray:
+    def extract_features(self, graph_data: Any) -> np.ndarray:
         """
         Extract features from a PyG Data object (complex graph).
         
@@ -321,7 +321,7 @@ class RFBaseline:
         
         return np.array(features, dtype=np.float32)
     
-    def train(self, protein_sequences: list, ligand_smiles: list, 
+    def train(self, protein_sequences: List[str], ligand_smiles: List[str], 
               affinities: np.ndarray) -> float:
         """
         Train the Random Forest model.
@@ -352,7 +352,7 @@ class RFBaseline:
         
         return train_score
     
-    def predict(self, protein_sequences: list, ligand_smiles: list) -> np.ndarray:
+    def predict(self, protein_sequences: List[str], ligand_smiles: List[str]) -> np.ndarray:
         """
         Make predictions on new samples.
         
@@ -400,7 +400,7 @@ class LinearBaseline:
         ]
         return np.array(features, dtype=np.float32)
     
-    def train(self, protein_sequences: list, ligand_smiles: list,
+    def train(self, protein_sequences: List[str], ligand_smiles: List[str],
               affinities: np.ndarray) -> float:
         """Train the linear model."""
         X = np.array([
@@ -417,7 +417,7 @@ class LinearBaseline:
         
         return train_score
     
-    def predict(self, protein_sequences: list, ligand_smiles: list) -> np.ndarray:
+    def predict(self, protein_sequences: List[str], ligand_smiles: List[str]) -> np.ndarray:
         """Make predictions."""
         if not self.is_fitted:
             raise RuntimeError("Model must be trained first")

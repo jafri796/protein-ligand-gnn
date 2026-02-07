@@ -167,16 +167,41 @@ class WeightedVotingEnsemble:
         Returns:
             Weighted ensemble predictions
         """
-        # Get predictions from each model
-        soft_voting_ensemble = SoftVotingEnsemble(self.models, device=str(self.device))
-        predictions_all, stds_all = soft_voting_ensemble.predict(data_loader, return_std=True)
+        predictions_per_model = []
         
-        # This is simplified; for true weighted voting, need individual model predictions
-        # and weights applied per sample
-        weighted_predictions = predictions_all  # For now, return soft voting
+        with torch.no_grad():
+            for model in self.models:
+                model.eval()
+                model = model.to(self.device)
+                
+                batch_predictions = []
+                for batch in data_loader:
+                    if isinstance(batch, (list, tuple)):
+                        batch = [b.to(self.device) if torch.is_tensor(b) else b for b in batch]
+                    elif torch.is_tensor(batch):
+                        batch = batch.to(self.device)
+                    else:
+                        for key in batch:
+                            if torch.is_tensor(batch[key]):
+                                batch[key] = batch[key].to(self.device)
+                    
+                    outputs = model(batch) if not isinstance(batch, dict) else model(**batch)
+                    batch_predictions.append(outputs.cpu().numpy())
+                
+                predictions_per_model.append(np.concatenate(batch_predictions, axis=0))
+        
+        # Stack: (n_models, n_samples, ...)
+        predictions_stacked = np.stack(predictions_per_model, axis=0)
+        
+        # Apply weights: weighted mean across models
+        # weights shape: (n_models,) → broadcast over samples
+        weighted_predictions = np.tensordot(self.weights, predictions_stacked, axes=([0], [0]))
         
         if return_uncertainty:
-            return weighted_predictions, stds_all
+            # Weighted std: sqrt( sum_i w_i * (pred_i - weighted_mean)^2 )
+            deviations = predictions_stacked - weighted_predictions[np.newaxis, ...]
+            weighted_std = np.sqrt(np.tensordot(self.weights, deviations ** 2, axes=([0], [0])))
+            return weighted_predictions, weighted_std
         else:
             return weighted_predictions
     
@@ -403,14 +428,14 @@ def create_ensemble_from_config(
                 - seed: [42, 43, 44]  # Different random seeds
                 - graph_k: [5, 10, 15]  # Different k-NN values
     """
-    from models.painn_affinity import PaiNNAffinity
+    from models.painn_affinity import PaiNNAffinityPredictor
     
     # Load models
     models = []
     for model_path in model_paths:
         logger.info(f"Loading model from {model_path}")
-        model = PaiNNAffinity(config['model'])
-        checkpoint = torch.load(model_path, map_location=device)
+        model = PaiNNAffinityPredictor(config['model'])
+        checkpoint = torch.load(model_path, map_location=device, weights_only=True)
         model.load_state_dict(checkpoint['model_state_dict'])
         model = model.to(device)
         models.append(model)

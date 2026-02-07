@@ -11,10 +11,10 @@ Based on IGN/GIGN papers and PyG best practices.
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch_geometric.data import Data, HeteroData
 from torch_geometric.nn import knn_graph, radius_graph
 from typing import Tuple, Optional, Dict
-from scipy.spatial import distance_matrix
 
 
 def construct_ligand_graph(
@@ -162,23 +162,29 @@ def construct_interaction_edges(
             torch.empty((0, 4), dtype=torch.float)
         )
     
+    # Compute edge features for forward direction (ligand → protein)
+    ligand_pos = ligand_coords[ligand_idx]
+    protein_pos = protein_coords[protein_idx]
+    
+    edge_vec_fwd = protein_pos - ligand_pos
+    edge_dist = torch.norm(edge_vec_fwd, dim=1, keepdim=True)
+    edge_dir_fwd = edge_vec_fwd / (edge_dist + 1e-8)
+    
+    # Reverse direction (protein → ligand): negate direction vectors
+    edge_dir_rev = -edge_dir_fwd
+    
     # Create bidirectional edges
+    # Forward: ligand(local) → protein(local)
+    # Reverse: protein(local) → ligand(local)
     edge_index = torch.stack([
         torch.cat([ligand_idx, protein_idx]),
         torch.cat([protein_idx, ligand_idx])
     ], dim=0)
     
-    # Compute edge features
-    ligand_pos = ligand_coords[ligand_idx]
-    protein_pos = protein_coords[protein_idx]
-    
-    edge_vec = protein_pos - ligand_pos
-    edge_dist = torch.norm(edge_vec, dim=1, keepdim=True)
-    edge_dir = edge_vec / (edge_dist + 1e-8)
-    
-    # Duplicate for bidirectional edges
-    edge_attr = torch.cat([edge_dist, edge_dir], dim=1)
-    edge_attr = torch.cat([edge_attr, edge_attr], dim=0)
+    # Edge attributes with correct direction for each direction
+    edge_attr_fwd = torch.cat([edge_dist, edge_dir_fwd], dim=1)
+    edge_attr_rev = torch.cat([edge_dist, edge_dir_rev], dim=1)
+    edge_attr = torch.cat([edge_attr_fwd, edge_attr_rev], dim=0)
     
     return edge_index, edge_attr
 
@@ -217,8 +223,22 @@ def construct_complex_graph(
     num_ligand = ligand_data.num_nodes
     num_protein = protein_data.num_nodes
     
-    # Concatenate node features
-    x = torch.cat([ligand_data.x, protein_data.x], dim=0)
+    # Pad node features to same dimension before concatenation
+    ligand_feat_dim = ligand_data.x.size(1)
+    protein_feat_dim = protein_data.x.size(1)
+    max_feat_dim = max(ligand_feat_dim, protein_feat_dim)
+    
+    if ligand_feat_dim < max_feat_dim:
+        ligand_x = F.pad(ligand_data.x, (0, max_feat_dim - ligand_feat_dim))
+    else:
+        ligand_x = ligand_data.x
+    
+    if protein_feat_dim < max_feat_dim:
+        protein_x = F.pad(protein_data.x, (0, max_feat_dim - protein_feat_dim))
+    else:
+        protein_x = protein_data.x
+    
+    x = torch.cat([ligand_x, protein_x], dim=0)
     pos = torch.cat([ligand_data.pos, protein_data.pos], dim=0)
     
     # Adjust protein edge indices
@@ -231,8 +251,16 @@ def construct_complex_graph(
         cutoff=interaction_cutoff
     )
     
-    # Adjust interaction edge indices (ligand nodes: 0-n_lig, protein: n_lig-end)
-    inter_edge_index[1] += num_ligand  # Protein nodes start at num_ligand
+    # Remap interaction edge indices from local to global index space.
+    # construct_interaction_edges returns bidirectional edges:
+    #   Forward half (first N_inter edges): src=ligand(local), dst=protein(local)
+    #   Reverse half (last N_inter edges):  src=protein(local), dst=ligand(local)
+    # We must add num_ligand ONLY to protein node indices.
+    n_inter = inter_edge_index.size(1) // 2
+    # Forward: row0 = ligand (no offset), row1 = protein (+ num_ligand)
+    inter_edge_index[1, :n_inter] += num_ligand
+    # Reverse: row0 = protein (+ num_ligand), row1 = ligand (no offset)
+    inter_edge_index[0, n_inter:] += num_ligand
     
     # Combine all edges
     edge_index = torch.cat([
@@ -241,23 +269,46 @@ def construct_complex_graph(
         inter_edge_index
     ], dim=1)
     
-    # Pad edge attributes to same dimension
+    # Pad edge attributes to same dimension and add edge type indicators
     max_edge_dim = max(
         ligand_data.edge_attr.size(1),
         protein_data.edge_attr.size(1),
         inter_edge_attr.size(1)
     )
     
-    def pad_edge_attr(attr, target_dim):
+    def pad_edge_attr(attr, target_dim, edge_type_id):
+        """Pad edge attributes and add edge type indicator.
+        
+        Args:
+            attr: Edge attributes tensor
+            target_dim: Target dimension after padding
+            edge_type_id: 0=ligand, 1=protein, 2=interaction
+        """
+        num_edges = attr.size(0)
+        
+        # Pad features to target dimension
         if attr.size(1) < target_dim:
-            padding = torch.zeros(attr.size(0), target_dim - attr.size(1))
-            return torch.cat([attr, padding], dim=1)
-        return attr
+            padding = torch.zeros(num_edges, target_dim - attr.size(1))
+            attr_padded = torch.cat([attr, padding], dim=1)
+        else:
+            attr_padded = attr
+        
+        # Add edge type one-hot indicator (3 types)
+        edge_type = torch.zeros(num_edges, 3)
+        edge_type[:, edge_type_id] = 1.0
+        
+        return torch.cat([attr_padded, edge_type], dim=1)
+    
+    # Concatenate with edge type indicators
+    # Edge types: 0=ligand-ligand, 1=protein-protein, 2=ligand-protein interaction
+    edge_attr_ligand = pad_edge_attr(ligand_data.edge_attr, max_edge_dim, 0)
+    edge_attr_protein = pad_edge_attr(protein_data.edge_attr, max_edge_dim, 1)
+    edge_attr_inter = pad_edge_attr(inter_edge_attr, max_edge_dim, 2)
     
     edge_attr = torch.cat([
-        pad_edge_attr(ligand_data.edge_attr, max_edge_dim),
-        pad_edge_attr(protein_data.edge_attr, max_edge_dim),
-        pad_edge_attr(inter_edge_attr, max_edge_dim)
+        edge_attr_ligand,
+        edge_attr_protein,
+        edge_attr_inter
     ], dim=0)
     
     # Create batch indices for pooling
@@ -318,13 +369,18 @@ def _construct_heterogeneous_complex(
     )
     
     if inter_edge_index.size(1) > 0:
-        # Ligand to protein
-        data['ligand', 'interacts_with', 'protein'].edge_index = inter_edge_index
-        data['ligand', 'interacts_with', 'protein'].edge_attr = inter_edge_attr
+        # construct_interaction_edges returns bidirectional edges:
+        #   First half: ligand(local) → protein(local)
+        #   Second half: protein(local) → ligand(local)
+        n_inter = inter_edge_index.size(1) // 2
         
-        # Protein to ligand (reverse)
-        data['protein', 'interacts_with', 'ligand'].edge_index = inter_edge_index.flip(0)
-        data['protein', 'interacts_with', 'ligand'].edge_attr = inter_edge_attr
+        # Ligand to protein (forward half)
+        data['ligand', 'interacts_with', 'protein'].edge_index = inter_edge_index[:, :n_inter]
+        data['ligand', 'interacts_with', 'protein'].edge_attr = inter_edge_attr[:n_inter]
+        
+        # Protein to ligand (reverse half)
+        data['protein', 'interacts_with', 'ligand'].edge_index = inter_edge_index[:, n_inter:]
+        data['protein', 'interacts_with', 'ligand'].edge_attr = inter_edge_attr[n_inter:]
     
     return data
 

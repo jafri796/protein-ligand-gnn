@@ -30,24 +30,20 @@ sys.path.append(str(Path(__file__).parent.parent))
 
 from data.dataset import ProteinLigandDataset
 from models.painn_affinity import PaiNNAffinityPredictor
+from utils import set_seed
+from utils.config import load_config
 
-logging.basicConfig(level=logging.INFO)
+# Configure logging only if not already configured
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler('training.log')
+        ]
+    )
 logger = logging.getLogger(__name__)
-
-
-def set_seed(seed: int, deterministic: bool = True):
-    """Set all random seeds for reproducibility."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    import random
-    random.seed(seed)
-    
-    if torch.cuda.is_available():
-        if deterministic:
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-        logger.info(f"CUDA reproducibility: deterministic={deterministic}")
 
 
 def compute_metrics(predictions, targets):
@@ -87,12 +83,14 @@ def compute_metrics(predictions, targets):
 
 
 class Trainer:
-    """Training manager."""
+    """Training manager with gradient accumulation and distributed training support."""
     
-    def __init__(self, model, config, device):
+    def __init__(self, model, config, device, gradient_accumulation_steps=1):
         self.model = model.to(device)
         self.config = config
         self.device = device
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.step = 0  # Global step counter for gradient accumulation
         
         # Optimizer
         self.optimizer = torch.optim.Adam(
@@ -132,45 +130,84 @@ class Trainer:
             self.writer = None
     
     def train_epoch(self, train_loader, epoch):
-        """Train for one epoch."""
+        """Train for one epoch with gradient accumulation support."""
         self.model.train()
         total_loss = 0
         predictions = []
         targets = []
+        
+        self.optimizer.zero_grad()  # Zero gradients at start of epoch
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
         for batch_idx, batch in enumerate(pbar):
             batch = batch.to(self.device)
             
             # Forward pass
-            self.optimizer.zero_grad()
             output = self.model(batch)
             loss = self.criterion(output, batch.y)
+            
+            # Scale loss for gradient accumulation
+            loss = loss / self.gradient_accumulation_steps
+            
+            # NaN/Inf detection
+            if not torch.isfinite(loss):
+                logger.warning(f"Non-finite loss detected: {loss.item()}. Skipping batch.")
+                continue
             
             # Backward pass
             loss.backward()
             
-            # Gradient clipping
+            # Track metrics (use unscaled loss for reporting)
+            total_loss += (loss.item() * self.gradient_accumulation_steps)
+            predictions.extend(output.detach().cpu().numpy())
+            targets.extend(batch.y.detach().cpu().numpy())
+            
+            # Gradient update every N steps (gradient accumulation)
+            if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                self.step += 1
+                
+                # Gradient norm monitoring
+                total_norm = 0.0
+                for p in self.model.parameters():
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2).item()
+                        total_norm += param_norm ** 2
+                total_norm = total_norm ** 0.5
+                
+                if total_norm > 1000:
+                    logger.warning(f"Exploding gradients detected: norm={total_norm:.2f}")
+                elif total_norm < 1e-6:
+                    logger.warning(f"Vanishing gradients detected: norm={total_norm:.2e}")
+                
+                # Gradient clipping
+                if self.config['training'].get('gradient_clip'):
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
+                        self.config['training']['gradient_clip']
+                    )
+                
+                # Optimizer step
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+                
+                # Log to TensorBoard
+                if self.writer and self.step % 10 == 0:
+                    global_step = epoch * len(train_loader) + batch_idx
+                    self.writer.add_scalar('train/batch_loss', loss.item() * self.gradient_accumulation_steps, global_step)
+                    self.writer.add_scalar('train/gradient_norm', total_norm, global_step)
+            
+            # Update progress bar
+            pbar.set_postfix({'loss': loss.item() * self.gradient_accumulation_steps})
+        
+        # Handle remaining gradients if any
+        if len(train_loader) % self.gradient_accumulation_steps != 0:
             if self.config['training'].get('gradient_clip'):
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config['training']['gradient_clip']
                 )
-            
             self.optimizer.step()
-            
-            # Track metrics
-            total_loss += loss.item()
-            predictions.extend(output.detach().cpu().numpy())
-            targets.extend(batch.y.detach().cpu().numpy())
-            
-            # Update progress bar
-            pbar.set_postfix({'loss': loss.item()})
-            
-            # Log to TensorBoard
-            if self.writer and batch_idx % 10 == 0:
-                global_step = epoch * len(train_loader) + batch_idx
-                self.writer.add_scalar('train/batch_loss', loss.item(), global_step)
+            self.optimizer.zero_grad()
         
         # Compute epoch metrics
         metrics = compute_metrics(predictions, targets)
@@ -278,79 +315,150 @@ class Trainer:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    """Main training function with comprehensive error handling."""
+    parser = argparse.ArgumentParser(description='Train PaiNN affinity model')
     parser.add_argument('--config', type=str, required=True, help='Path to config file')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
     parser.add_argument('--gpu', type=int, default=0, help='GPU device ID')
+    parser.add_argument('--split-type', type=str, default='random', choices=['random', 'scaffold', 'lp-pdbbind'],
+                       help='Split type: random, scaffold-based, or LP-PDBBind (leak-proof)')
+    parser.add_argument('--gradient-accumulation', type=int, default=1,
+                       help='Number of gradient accumulation steps (default: 1)')
+    parser.add_argument('--distributed', action='store_true',
+                       help='Enable distributed training with DDP')
+    parser.add_argument('--local-rank', type=int, default=0,
+                       help='Local rank for distributed training')
     args = parser.parse_args()
     
-    # Load config
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
+    # Initialize distributed training if requested
+    if args.distributed:
+        torch.distributed.init_process_group(backend='nccl')
+        device = torch.device(f'cuda:{args.local_rank}')
+        torch.cuda.set_device(device)
+        logger.info(f"Distributed training: rank {torch.distributed.get_rank()}/{torch.distributed.get_world_size()}")
+    else:
+        device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     
-    # Set seed with deterministic flag from config
-    reproducibility_config = config.get('reproducibility', {})
-    set_seed(
-        reproducibility_config.get('seed', 42),
-        deterministic=reproducibility_config.get('deterministic', True)
-    )
-    
-    # Device
-    device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    
-    # Create datasets
-    logger.info("Loading datasets...")
-    train_dataset = ProteinLigandDataset(
-        data_dir=config['data']['data_dir'],
-        index_file=config['data']['train_split'],
-        cache_dir=config['data']['cache_dir'],
-        binding_pocket_only=config['data']['binding_pocket_only'],
-        pocket_cutoff=config['data']['pocket_cutoff'],
-        interaction_cutoff=config['data']['interaction_cutoff']
-    )
-    
-    val_dataset = ProteinLigandDataset(
-        data_dir=config['data']['data_dir'],
-        index_file=config['data']['val_split'],
-        cache_dir=config['data']['cache_dir'],
-        binding_pocket_only=config['data']['binding_pocket_only'],
-        pocket_cutoff=config['data']['pocket_cutoff'],
-        interaction_cutoff=config['data']['interaction_cutoff']
-    )
-    
-    # Create dataloaders
-    train_loader = PyGDataLoader(
-        train_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=True,
-        num_workers=config['data']['num_workers'],
-        pin_memory=config['data']['pin_memory']
-    )
-    
-    val_loader = PyGDataLoader(
-        val_dataset,
-        batch_size=config['training']['batch_size'],
-        shuffle=False,
-        num_workers=config['data']['num_workers'],
-        pin_memory=config['data']['pin_memory']
-    )
-    
-    logger.info(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
-    
-    # Create model
-    logger.info("Creating model...")
-    model = PaiNNAffinityPredictor(config['model'])
-    logger.info(f"Model parameters: {model.get_num_params():,}")
-    
-    # Create trainer
-    trainer = Trainer(model, config, device)
-    
-    # Train
-    trainer.fit(
-        train_loader,
-        val_loader,
-        num_epochs=config['training']['num_epochs']
-    )
+    try:
+        # Load config
+        logger.info(f"Loading config from {args.config}")
+        config = load_config(args.config)
+        
+        # Set seed (different for each rank in distributed mode)
+        seed = args.seed + (torch.distributed.get_rank() if args.distributed else 0)
+        set_seed(seed, deterministic=True)
+        logger.info(f"Set random seed to {seed}")
+        
+        # Load data
+        logger.info(f"Loading datasets (split_type={args.split_type})...")
+        try:
+            # Determine index files based on split type
+            if args.split_type == 'scaffold':
+                train_index = config['data'].get('train_scaffold_split', config['data']['train_split'].replace('train.txt', 'train_scaffold.txt'))
+                val_index = config['data'].get('val_scaffold_split', config['data']['val_split'].replace('val.txt', 'val_scaffold.txt'))
+            elif args.split_type == 'lp-pdbbind':
+                train_index = config['data']['train_split']
+                val_index = config['data']['val_split']
+                # Verify LP-PDBBind splits exist
+                if not Path(train_index).exists():
+                    logger.error(f"LP-PDBBind split not found: {train_index}")
+                    logger.error("Run: python data/splits.py to create LP-PDBBind splits")
+                    raise FileNotFoundError(f"LP-PDBBind split not found: {train_index}")
+            else:  # random
+                train_index = config['data']['train_split']
+                val_index = config['data']['val_split']
+            
+            train_dataset = ProteinLigandDataset(
+                data_dir=config['data']['data_dir'],
+                index_file=train_index,
+                cache_dir=config['data'].get('cache_dir'),
+                use_cache=config['data'].get('use_cache', True)
+            )
+            
+            val_dataset = ProteinLigandDataset(
+                data_dir=config['data']['data_dir'],
+                index_file=val_index,
+                cache_dir=config['data'].get('cache_dir'),
+                use_cache=config['data'].get('use_cache', True)
+            )
+        except FileNotFoundError as e:
+            logger.error(f"Data file not found: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Failed to load datasets: {e}")
+            raise
+        
+        # Create data loaders
+        try:
+            train_loader = PyGDataLoader(
+                train_dataset,
+                batch_size=config['training']['batch_size'],
+                shuffle=True,
+                num_workers=config['data']['num_workers'],
+                pin_memory=config['data']['pin_memory']
+            )
+            
+            val_loader = PyGDataLoader(
+                val_dataset,
+                batch_size=config['training']['batch_size'],
+                shuffle=False,
+                num_workers=config['data']['num_workers'],
+                pin_memory=config['data']['pin_memory']
+            )
+        except Exception as e:
+            logger.error(f"Failed to create data loaders: {e}")
+            raise
+        
+        logger.info(f"Train: {len(train_dataset)} | Val: {len(val_dataset)}")
+        
+        # Create model
+        logger.info("Creating model...")
+        try:
+            model = PaiNNAffinityPredictor(config['model'])
+            logger.info(f"Model parameters: {model.get_num_params():,}")
+        except Exception as e:
+            logger.error(f"Failed to create model: {e}")
+            raise
+        
+        # Create trainer with gradient accumulation
+        try:
+            trainer = Trainer(
+                model, 
+                config, 
+                device,
+                gradient_accumulation_steps=args.gradient_accumulation
+            )
+            logger.info(f"Trainer initialized with gradient accumulation: {args.gradient_accumulation}")
+        except Exception as e:
+            logger.error(f"Failed to create trainer: {e}")
+            raise
+        
+        # Train
+        logger.info("Starting training...")
+        try:
+            trainer.fit(
+                train_loader,
+                val_loader,
+                num_epochs=config['training']['num_epochs']
+            )
+            logger.info("Training completed successfully!")
+        except KeyboardInterrupt:
+            logger.info("Training interrupted by user")
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                logger.error("GPU out of memory. Try reducing batch size.")
+            else:
+                logger.error(f"Runtime error during training: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Training failed: {e}")
+            raise
+        
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        sys.exit(1)
 
 
 if __name__ == '__main__':

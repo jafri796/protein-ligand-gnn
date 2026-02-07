@@ -45,16 +45,16 @@ class TestFeaturization:
         assert np.all(np.isfinite(features)), "Features contain NaN or Inf"
     
     def test_bond_features_dimension(self):
-        """Bond features should be 9-13 dimensional (9 without 3D, 13 with dihedral)."""
+        """Bond features should be 10 or 12 dimensional (10 without 3D, 12 with dihedral)."""
         from rdkit import Chem
         
         mol = Chem.MolFromSmiles("C=C")  # Ethene
         bond = mol.GetBondWithIdx(0)
         features = get_bond_features(bond)
         
-        # Without 3D coordinates: 9 features
-        # With 3D coordinates: 13 features (includes dihedral sin/cos)
-        assert len(features) in [9, 13], f"Expected 9 or 13 features, got {len(features)}"
+        # Without 3D coordinates: 10 features (4+1+1+3+1)
+        # With 3D coordinates: 12 features (includes dihedral sin/cos)
+        assert len(features) in [10, 12], f"Expected 10 or 12 features, got {len(features)}"
         assert np.all(np.isfinite(features)), "Features contain NaN or Inf"
     
     def test_residue_features_dimension(self):
@@ -197,35 +197,143 @@ class TestEquivariantLayers:
         assert torch.isfinite(v_out).all()
 
 
+class TestRotationEquivariance:
+    """Test SE(3) rotation equivariance of PaiNN layers."""
+    
+    def test_painn_message_rotation_equivariance(self):
+        """Test that PaiNNMessage preserves SE(3) equivariance.
+        
+        Under rotation R:
+        - Scalar features should be invariant: s' = s
+        - Vector features should be equivariant: v' = R @ v
+        - Edge vectors should transform: edge_vec' = R @ edge_vec
+        """
+        batch_size = 10
+        hidden_dim = 32
+        num_rbf = 10
+        
+        # Create random features
+        s = torch.randn(batch_size, hidden_dim)
+        v = torch.randn(batch_size, 3, hidden_dim)
+        edge_index = torch.tensor([[0, 1, 2, 3, 4], [1, 2, 3, 4, 0]])
+        edge_rbf = torch.randn(edge_index.size(1), num_rbf)
+        edge_vec = torch.randn(edge_index.size(1), 3)
+        edge_vec = edge_vec / (edge_vec.norm(dim=1, keepdim=True) + 1e-8)
+        
+        # Create random rotation matrix
+        angle = torch.rand(1) * 2 * np.pi
+        axis = torch.randn(3)
+        axis = axis / axis.norm()
+        
+        # Rodrigues rotation formula
+        K = torch.zeros(3, 3)
+        K[0, 1] = -axis[2]
+        K[0, 2] = axis[1]
+        K[1, 0] = axis[2]
+        K[1, 2] = -axis[0]
+        K[2, 0] = -axis[1]
+        K[2, 1] = axis[0]
+        
+        R = torch.eye(3) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
+        
+        # Apply rotation to vector features and edge vectors
+        v_rotated = torch.einsum('ij,bjh->bih', R, v)
+        edge_vec_rotated = torch.einsum('ij,ej->ei', R, edge_vec)
+        
+        # Create message passing layer
+        layer = PaiNNMessage(hidden_dim, num_rbf)
+        layer.eval()
+        
+        # Forward pass with original features
+        ds1, dv1 = layer(s, v, edge_index, edge_rbf, edge_vec)
+        
+        # Forward pass with rotated features
+        ds2, dv2 = layer(s, v_rotated, edge_index, edge_rbf, edge_vec_rotated)
+        
+        # Scalars should be invariant
+        assert torch.allclose(ds1, ds2, atol=1e-5), "Scalars not rotation invariant"
+        
+        # Vectors should be equivariant: R @ dv1 should equal dv2
+        dv1_rotated = torch.einsum('ij,bjh->bih', R, dv1)
+        assert torch.allclose(dv1_rotated, dv2, atol=1e-4), "Vectors not rotation equivariant"
+    
+    def test_painn_update_rotation_equivariance(self):
+        """Test that PaiNNUpdate preserves SE(3) equivariance."""
+        batch_size = 10
+        hidden_dim = 32
+        
+        s = torch.randn(batch_size, hidden_dim)
+        v = torch.randn(batch_size, 3, hidden_dim)
+        
+        # Create random rotation matrix
+        angle = torch.rand(1) * 2 * np.pi
+        axis = torch.randn(3)
+        axis = axis / axis.norm()
+        
+        K = torch.zeros(3, 3)
+        K[0, 1] = -axis[2]
+        K[0, 2] = axis[1]
+        K[1, 0] = axis[2]
+        K[1, 2] = -axis[0]
+        K[2, 0] = -axis[1]
+        K[2, 1] = axis[0]
+        
+        R = torch.eye(3) + torch.sin(angle) * K + (1 - torch.cos(angle)) * (K @ K)
+        
+        v_rotated = torch.einsum('ij,bjh->bih', R, v)
+        
+        # Create update layer
+        update = PaiNNUpdate(hidden_dim)
+        update.eval()
+        
+        # Forward pass
+        s_out1, v_out1 = update(s, v)
+        s_out2, v_out2 = update(s, v_rotated)
+        
+        # Scalars should be invariant
+        assert torch.allclose(s_out1, s_out2, atol=1e-5), "Scalars not rotation invariant in update"
+        
+        # Vectors should be equivariant
+        v_out1_rotated = torch.einsum('ij,bjh->bih', R, v_out1)
+        assert torch.allclose(v_out1_rotated, v_out2, atol=1e-4), "Vectors not rotation equivariant in update"
+
+
 class TestModel:
     """Test the full PaiNN model."""
     
     def test_model_creation(self):
         """Test model instantiation."""
-        model = PaiNNAffinityPredictor(
-            node_dim=49,
-            edge_dim=64,
-            hidden_dim=64,
-            num_layers=2,
-            num_rbf=10,
-            cutoff=10.0,
-            dropout=0.1
-        )
+        config = {
+            'hidden_dim': 64,
+            'num_message_passing_layers': 2,
+            'num_protein_layers': 2,
+            'num_rbf': 10,
+            'cutoff': 10.0,
+            'dropout': 0.1
+        }
+        model = PaiNNAffinityPredictor(config)
         assert model is not None
     
     def test_model_forward_pass(self):
         """Test model forward pass with batch data."""
         from torch_geometric.data import Data, Batch
+        from data.featurization import LIGAND_ATOM_FEATURE_DIM, LIGAND_BOND_FEATURE_DIM, PROTEIN_RESIDUE_FEATURE_DIM
         
-        model = PaiNNAffinityPredictor(
-            node_dim=49,
-            edge_dim=64,
-            hidden_dim=64,
-            num_layers=2,
-            num_rbf=10,
-            cutoff=10.0,
-            dropout=0.1
-        )
+        config = {
+            'hidden_dim': 64,
+            'num_message_passing_layers': 2,
+            'num_protein_layers': 2,
+            'num_rbf': 10,
+            'cutoff': 10.0,
+            'dropout': 0.1
+        }
+        model = PaiNNAffinityPredictor(config)
+        model.eval()
+        
+        # Padded feature dim (matches construct_complex_graph)
+        padded_dim = max(LIGAND_ATOM_FEATURE_DIM, PROTEIN_RESIDUE_FEATURE_DIM)
+        # Edge attr dim: max(bond_feat+1, 4, 4) + 3 edge_type one-hot
+        edge_attr_dim = LIGAND_BOND_FEATURE_DIM + 1 + 3
         
         # Create batch of dummy complexes
         data_list = []
@@ -234,14 +342,12 @@ class TestModel:
             num_protein = 15
             num_nodes = num_ligand + num_protein
             
-            # Ligand features (49-dim)
-            x_ligand = torch.randn(num_ligand, 49)
-            x_protein = torch.randn(num_protein, 31)
-            x = torch.cat([x_ligand, x_protein], dim=0)
+            # Both padded to same dim (as construct_complex_graph does)
+            x = torch.randn(num_nodes, padded_dim)
             
             pos = torch.randn(num_nodes, 3)
             edge_index = torch.randint(0, num_nodes, (2, 30))
-            edge_attr = torch.randn(30, 10)
+            edge_attr = torch.randn(30, edge_attr_dim)
             
             node_type = torch.cat([
                 torch.zeros(num_ligand, dtype=torch.long),
@@ -258,7 +364,8 @@ class TestModel:
         batch = Batch.from_data_list(data_list)
         
         # Forward pass
-        output = model(batch)
+        with torch.no_grad():
+            output = model(batch)
         
         assert output.shape == (2,), f"Expected output shape (2,), got {output.shape}"
         assert torch.isfinite(output).all(), "Output contains NaN or Inf"

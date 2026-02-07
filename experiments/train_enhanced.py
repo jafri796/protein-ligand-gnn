@@ -28,9 +28,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DistributedSampler
+from torch_geometric.loader import DataLoader as PyGDataLoader
 from torch.nn.parallel import DistributedDataParallel
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 from scipy.stats import pearsonr, spearmanr
 
@@ -183,11 +184,8 @@ class DistributedTrainer:
             
             for batch in pbar:
                 try:
-                    # Move batch to device
-                    batch = {
-                        k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                        for k, v in batch.items()
-                    }
+                    # Move batch to device (PyG Batch objects support .to())
+                    batch = batch.to(self.device)
                     
                     # Forward pass with optional AMP
                     self.optimizer.zero_grad()
@@ -195,7 +193,7 @@ class DistributedTrainer:
                     if self.scaler is not None:
                         with autocast():
                             pred = self.model(batch)
-                            loss = self.criterion(pred.view(-1), batch['affinity'].view(-1))
+                            loss = self.criterion(pred.view(-1), batch.y.view(-1))
                         
                         self.scaler.scale(loss).backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
@@ -203,7 +201,7 @@ class DistributedTrainer:
                         self.scaler.update()
                     else:
                         pred = self.model(batch)
-                        loss = self.criterion(pred.view(-1), batch['affinity'].view(-1))
+                        loss = self.criterion(pred.view(-1), batch.y.view(-1))
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
@@ -211,7 +209,7 @@ class DistributedTrainer:
                     # Track metrics
                     total_loss += loss.item()
                     predictions.extend(pred.detach().cpu().numpy().flatten())
-                    targets.extend(batch['affinity'].cpu().numpy().flatten())
+                    targets.extend(batch.y.cpu().numpy().flatten())
                     num_batches += 1
                     
                     pbar.set_postfix({
@@ -255,17 +253,14 @@ class DistributedTrainer:
                 
                 for batch in pbar:
                     try:
-                        batch = {
-                            k: v.to(self.device) if isinstance(v, torch.Tensor) else v
-                            for k, v in batch.items()
-                        }
+                        batch = batch.to(self.device)
                         
                         pred = self.model(batch)
-                        loss = self.criterion(pred.view(-1), batch['affinity'].view(-1))
+                        loss = self.criterion(pred.view(-1), batch.y.view(-1))
                         
                         total_loss += loss.item()
                         predictions.extend(pred.cpu().numpy().flatten())
-                        targets.extend(batch['affinity'].cpu().numpy().flatten())
+                        targets.extend(batch.y.cpu().numpy().flatten())
                         num_batches += 1
                         
                     except Exception as e:
@@ -463,7 +458,7 @@ def main():
         if args.output_dir:
             config['logging']['checkpoint_dir'] = args.output_dir
         if args.epochs:
-            config['training']['max_epochs'] = args.epochs
+            config['training']['num_epochs'] = args.epochs
         if args.batch_size:
             config['training']['batch_size'] = args.batch_size
         
@@ -472,15 +467,20 @@ def main():
         trainer.setup_model()
         
         # Data
+        data_dir = config.get('data', {}).get('data_dir', args.data_dir)
+        train_index = config.get('data', {}).get('train_split', 'train.csv')
+        val_index = config.get('data', {}).get('val_split', 'val.csv')
+        cache_dir = config.get('data', {}).get('cache_dir', None)
+        
         train_dataset = ProteinLigandDataset(
-            data_dir=args.data_dir,
-            split='train',
-            cache_dir=None
+            data_dir=data_dir,
+            index_file=train_index,
+            cache_dir=cache_dir
         )
         val_dataset = ProteinLigandDataset(
-            data_dir=args.data_dir,
-            split='val',
-            cache_dir=None
+            data_dir=data_dir,
+            index_file=val_index,
+            cache_dir=cache_dir
         )
         
         train_sampler = (DistributedSampler(
@@ -491,7 +491,7 @@ def main():
             seed=config['reproducibility']['seed']
         ) if is_distributed else None)
         
-        train_loader = DataLoader(
+        train_loader = PyGDataLoader(
             train_dataset,
             batch_size=config['training']['batch_size'],
             sampler=train_sampler,
@@ -500,7 +500,7 @@ def main():
             pin_memory=True
         )
         
-        val_loader = DataLoader(
+        val_loader = PyGDataLoader(
             val_dataset,
             batch_size=config['training']['batch_size'] * 2,
             shuffle=False,
@@ -513,7 +513,7 @@ def main():
             logger.info(f"Val set: {len(val_dataset)} samples")
         
         # Train
-        trainer.fit(train_loader, val_loader, config['training']['max_epochs'])
+        trainer.fit(train_loader, val_loader, config['training']['num_epochs'])
     
     except Exception as e:
         logger.error(f"Training failed: {e}")

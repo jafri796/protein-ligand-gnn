@@ -20,7 +20,6 @@ import logging
 from .featurization import featurize_complex
 from .graph_construction import construct_complex_graph, construct_ligand_graph, construct_protein_graph
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
@@ -75,6 +74,16 @@ class ProteinLigandDataset(Dataset):
         
         # Validate files
         self._validate_files()
+        
+        # Compute target statistics for optional normalization
+        affinities = [item['affinity'] for item in self.data_list]
+        if affinities:
+            self.target_mean = float(np.mean(affinities))
+            self.target_std = float(np.std(affinities)) if len(affinities) > 1 else 1.0
+            logger.info(f"Target stats: mean={self.target_mean:.3f}, std={self.target_std:.3f}")
+        else:
+            self.target_mean = 0.0
+            self.target_std = 1.0
     
     def _load_index(self) -> List[Dict]:
         """Load index file with PDB IDs and affinities."""
@@ -233,7 +242,7 @@ class ProteinLigandDataset(Dataset):
             
             if cache_path.exists():
                 try:
-                    graph = torch.load(cache_path)
+                    graph = torch.load(cache_path, weights_only=False)  # PyG Data objects need pickle
                     if self.transform:
                         graph = self.transform(graph)
                     return graph

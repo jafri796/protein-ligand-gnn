@@ -42,27 +42,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from data.dataset import ProteinLigandDataset
 from models.painn_affinity import PaiNNAffinityPredictor
+from utils import set_seed
 
 # Alias for convenience
 PaiNNAffinity = PaiNNAffinityPredictor
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
 def load_config(config_path: str) -> Dict:
-    """Load YAML config file."""
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f)
-
-
-def set_seed(seed: int) -> None:
-    """Set random seed for reproducibility."""
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    """Load YAML config file.
+    
+    Note: Prefer utils.config.load_config for new code. This local
+    wrapper is kept for backward compatibility.
+    """
+    from utils.config import load_config as _load_config
+    return _load_config(config_path)
 
 
 def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, float]:
@@ -73,12 +68,12 @@ def compute_metrics(predictions: np.ndarray, targets: np.ndarray) -> Dict[str, f
     
     try:
         pearson, _ = pearsonr(predictions, targets)
-    except:
+    except (ValueError, FloatingPointError):
         pearson = np.nan
     
     try:
         spearman, _ = spearmanr(predictions, targets)
-    except:
+    except (ValueError, FloatingPointError):
         spearman = np.nan
     
     return {
@@ -153,11 +148,15 @@ class Evaluator:
                 
                 # Extract complex IDs (handle both single and batched scenarios)
                 if hasattr(batch, 'pdb_id'):
-                    if isinstance(batch.pdb_id, list):
-                        all_ids.extend(batch.pdb_id)
+                    pdb_ids = batch.pdb_id
+                    if isinstance(pdb_ids, list):
+                        all_ids.extend(pdb_ids)
+                    elif isinstance(pdb_ids, (tuple,)):
+                        all_ids.extend(list(pdb_ids))
+                    elif isinstance(pdb_ids, str):
+                        all_ids.append(pdb_ids)
                     else:
-                        # Tensor or single value
-                        all_ids.extend([str(x) for x in batch.pdb_id if isinstance(batch.pdb_id, (list, tuple))] or [batch.pdb_id])
+                        all_ids.append(str(pdb_ids))
                 else:
                     # Fallback: use indices
                     all_ids.extend([f"complex_{batch_idx}_{i}" for i in range(len(targets))])
@@ -256,7 +255,7 @@ class Evaluator:
         predictions: np.ndarray,
         targets: np.ndarray,
         complex_ids: List[str],
-        percentiles: List[float] = [10, 25, 50, 75, 90],
+        percentiles: List[float] = None,
     ) -> Dict[str, Any]:
         """Analyze prediction errors by percentile.
 
@@ -269,6 +268,8 @@ class Evaluator:
         Returns:
             Error analysis statistics
         """
+        if percentiles is None:
+            percentiles = [10, 25, 50, 75, 90]
         errors = np.abs(predictions - targets)
         error_pcts = np.percentile(errors, percentiles)
 
@@ -316,7 +317,7 @@ def main(args: argparse.Namespace):
     logger.info(f"Loading model from {args.model}...")
     model = PaiNNAffinity(config['model'])
     
-    checkpoint = torch.load(args.model, map_location=device)
+    checkpoint = torch.load(args.model, map_location=device, weights_only=True)
     if "model_state_dict" in checkpoint:
         model.load_state_dict(checkpoint["model_state_dict"])
     else:

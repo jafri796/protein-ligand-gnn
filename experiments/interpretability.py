@@ -30,7 +30,6 @@ from models.painn_affinity import PaiNNAffinityPredictor
 from utils import ConfigLoader, set_seed
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 
 class AttentionExtractor:
@@ -231,26 +230,17 @@ class SHAPAnalyzer:
         self.model.eval()
         self.model.to(self.device)
         
-        # Create prediction function for aggregated features
-        def predict_fn(X: np.ndarray) -> np.ndarray:
-            """Wrapper for SHAP - expects 2D array input."""
-            with torch.no_grad():
-                # X is aggregated features, need to reconstruct batch
-                # This is a simplified version using graph-level features
-                X_tensor = torch.tensor(X, dtype=torch.float32).to(self.device)
-                # Note: This requires a feature-based model wrapper
-                return X_tensor.mean(dim=-1).cpu().numpy()
-        
-        # Extract graph-level features for SHAP
+        # Extract graph-level features and store graph objects for prediction
         logger.info(f"Extracting features from {min(n_background + n_samples, len(dataset))} samples...")
         
         features = []
+        graph_objects = []
         for i in range(min(n_background + n_samples, len(dataset))):
             data = dataset[i]
             if hasattr(data, 'x') and data.x is not None:
-                # Aggregate node features to graph level
                 feat = data.x.mean(dim=0).numpy()
                 features.append(feat)
+                graph_objects.append(data)
                 
         if len(features) < n_background + 1:
             logger.error(f"Not enough samples: {len(features)}")
@@ -259,6 +249,49 @@ class SHAPAnalyzer:
         features = np.array(features)
         background = features[:n_background]
         samples_to_explain = features[n_background:n_background + n_samples]
+        
+        # Store graph objects for the samples to explain
+        explain_graphs = graph_objects[n_background:n_background + n_samples]
+        
+        # Create prediction function that perturbs graph node features
+        # SHAP will perturb the aggregated features; we map perturbations
+        # back to the graph by scaling node features proportionally.
+        model = self.model
+        device = self.device
+        
+        def predict_fn(X: np.ndarray) -> np.ndarray:
+            """SHAP-compatible prediction wrapper.
+            
+            For each perturbed feature vector, scales the original graph's
+            node features and runs a forward pass through the model.
+            """
+            predictions = []
+            with torch.no_grad():
+                for row_idx in range(X.shape[0]):
+                    # Map perturbed aggregated features back to graph
+                    # Use the corresponding graph (cycle if needed)
+                    graph_idx = row_idx % len(explain_graphs)
+                    graph = explain_graphs[graph_idx].clone()
+                    
+                    # Scale node features: multiply each feature dim by
+                    # ratio of perturbed to original aggregated value
+                    original_agg = features[n_background + graph_idx]
+                    perturbed_agg = X[row_idx]
+                    
+                    # Avoid division by zero
+                    scale = np.where(
+                        np.abs(original_agg) > 1e-8,
+                        perturbed_agg / original_agg,
+                        np.ones_like(original_agg)
+                    )
+                    scale_tensor = torch.tensor(scale, dtype=torch.float32)
+                    graph.x = graph.x * scale_tensor.unsqueeze(0)
+                    
+                    graph = graph.to(device)
+                    pred = model(graph)
+                    predictions.append(pred.cpu().numpy().flatten()[0])
+            
+            return np.array(predictions)
         
         # Create SHAP explainer
         explainer = shap.KernelExplainer(predict_fn, background)
@@ -476,16 +509,10 @@ def main():
     
     # Load model
     model_config = config.get('model', {})
-    model = PaiNNAffinityPredictor(
-        node_dim=model_config.get('node_dim', 128),
-        edge_dim=model_config.get('edge_dim', 64),
-        hidden_dim=model_config.get('hidden_dim', 256),
-        num_layers=model_config.get('num_message_passing_layers', 4),
-        dropout=model_config.get('dropout', 0.1)
-    )
+    model = PaiNNAffinityPredictor(model_config)
     
     # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location=device)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'])
     else:

@@ -49,10 +49,6 @@ from data.splits import create_lp_pdbbind_splits
 from models.baselines import GraphDTA, GraphDTAFeatureExtractor
 from utils import ConfigLoader, set_seed, validate_config
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
 
@@ -68,12 +64,12 @@ class BaselineEvaluator:
         # Correlation metrics with error handling
         try:
             pearson_r, _ = pearsonr(y_true, y_pred)
-        except:
+        except (ValueError, FloatingPointError):
             pearson_r = np.nan
         
         try:
             spearman_r, _ = spearmanr(y_true, y_pred)
-        except:
+        except (ValueError, FloatingPointError):
             spearman_r = np.nan
         
         # R² score
@@ -161,17 +157,39 @@ class BaselineTrainer:
                 ligand_sim_cutoff=data_config.get('ligand_sim_cutoff', 0.5),
             )
         
-        # Load split indices
-        train_file = splits_dir / 'train_indices.npy'
-        val_file = splits_dir / 'val_indices.npy'
-        test_file = splits_dir / 'test_indices.npy'
+        # Load split files (text files written by create_lp_pdbbind_splits)
+        train_file = splits_dir / 'train.txt'
+        val_file = splits_dir / 'val.txt'
+        test_file = splits_dir / 'test.txt'
         
         if not all([train_file.exists(), val_file.exists(), test_file.exists()]):
             raise FileNotFoundError(f"Split files not found in {splits_dir}")
         
-        train_indices = np.load(train_file)
-        val_indices = np.load(val_file)
-        test_indices = np.load(test_file)
+        def load_split_pdb_ids(filepath):
+            """Load PDB IDs from split text file."""
+            pdb_ids = set()
+            with open(filepath, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if parts:
+                        pdb_ids.add(parts[0])
+            return pdb_ids
+        
+        train_pdb_ids = load_split_pdb_ids(train_file)
+        val_pdb_ids = load_split_pdb_ids(val_file)
+        test_pdb_ids = load_split_pdb_ids(test_file)
+        
+        # Map PDB IDs to dataset indices
+        def get_indices_for_pdb_ids(dataset, pdb_ids):
+            indices = []
+            for i, entry in enumerate(dataset.data_list):
+                if entry.get('pdb_id', '') in pdb_ids:
+                    indices.append(i)
+            return indices
+        
+        train_indices = get_indices_for_pdb_ids(full_dataset, train_pdb_ids)
+        val_indices = get_indices_for_pdb_ids(full_dataset, val_pdb_ids)
+        test_indices = get_indices_for_pdb_ids(full_dataset, test_pdb_ids)
         
         logger.info(f"Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}")
         
@@ -325,7 +343,7 @@ class BaselineTrainer:
                     break
         
         # Evaluate on test set
-        model.load_state_dict(torch.load(self.output_dir / 'best_graphdta.pt'))
+        model.load_state_dict(torch.load(self.output_dir / 'best_graphdta.pt', weights_only=True))
         model.eval()
         test_preds = []
         with torch.no_grad():

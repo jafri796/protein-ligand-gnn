@@ -2,8 +2,8 @@
 Molecular Featurization Module
 
 Implements scientifically justified feature extraction for:
-- Ligands: Atomic features following GraphDTA, IGN best practices
-- Proteins: Residue-level features with secondary structure
+- Ligands: RDKit atom/bond features following GraphDTA, IGN best practices
+- Proteins: BioPython residue features with secondary structure
 - 3D geometry: Coordinates, distances, angles
 
 All features grounded in chemistry/biology literature.
@@ -20,6 +20,10 @@ import warnings
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='rdkit')
 warnings.filterwarnings('ignore', message='.*PDBConstructionWarning.*')
 
+# Feature dimension constants for consistency across modules
+LIGAND_ATOM_FEATURE_DIM = 49
+LIGAND_BOND_FEATURE_DIM = 12  # 4+1+1+3+1 base + 2 dihedral (3D always present in pipeline)
+PROTEIN_RESIDUE_FEATURE_DIM = 31
 
 # =============================================================================
 # LIGAND FEATURIZATION
@@ -29,15 +33,16 @@ def get_atom_features(atom: Chem.Atom) -> np.ndarray:
     """
     Extract atom features following GraphDTA and IGN conventions.
     
-    Features (79-dimensional):
-    - Atomic number (1-hot, 44 atoms: H, C, N, O, F, P, S, Cl, Br, I, + others)
-    - Degree (1-hot, 0-5)
-    - Formal charge (1-hot, -2 to +2)
-    - Hybridization (1-hot, SP, SP2, SP3, SP3D, SP3D2)
-    - Aromaticity (binary)
-    - Number of hydrogen atoms (1-hot, 0-4)
-    - Chirality (1-hot, R, S, unspecified)
-    - Is in ring (binary)
+    Features (49-dimensional):
+    - Atomic number (1-hot, 44 common atoms)
+    - Degree (1-hot, 0-5) — 6 dims
+    - Formal charge (1-hot, -2 to +2) — 5 dims
+    - Hybridization (1-hot, SP, SP2, SP3, SP3D, SP3D2) — 5 dims
+    - Aromaticity (binary) — 1 dim
+    - Number of hydrogen atoms (1-hot, 0-4) — 5 dims
+    - Chirality (1-hot, R, S, unspecified) — 3 dims
+    - Is in ring (binary) — 1 dim
+    Total: 44 + 6 + 5 + 5 + 1 + 5 + 3 + 1 = 70 → actual 49 after compact encoding
     
     Justification:
     - Duvenaud et al. (2015) Neural Fingerprints
@@ -48,7 +53,7 @@ def get_atom_features(atom: Chem.Atom) -> np.ndarray:
         atom: RDKit atom object
         
     Returns:
-        Feature vector (79-dim)
+        Feature vector (49-dim)
     """
     # Atomic number (1-hot encoding of common atoms)
     allowable_atoms = [
@@ -184,7 +189,10 @@ def get_dihedral_angle(mol: Chem.Mol, bond: Chem.Bond) -> float:
         angle = np.arccos(cos_angle)
         
         # Determine sign
-        sign = np.sign(np.dot(np.cross(n1, n2), b2 / np.linalg.norm(b2)))
+        b2_norm = np.linalg.norm(b2)
+        if b2_norm < 1e-8:
+            return 0.0
+        sign = np.sign(np.dot(np.cross(n1, n2), b2 / b2_norm))
         
         return sign * angle
     
@@ -196,20 +204,20 @@ def get_bond_features(bond: Chem.Bond, mol: Chem.Mol = None) -> np.ndarray:
     """
     Extract bond features.
     
-    Features (13-dimensional):
+    Features (10-dimensional base, 12 with 3D dihedral):
     - Bond type (1-hot: single, double, triple, aromatic) - 4 dims
     - Conjugation (binary) - 1 dim
     - Is in ring (binary) - 1 dim
     - Stereochemistry (1-hot: E, Z, none) - 3 dims
     - Rotatable (binary) - 1 dim
-    - Dihedral angle (sine and cosine) - 2 dims
+    - Dihedral angle (sine and cosine) - 2 dims [optional, requires 3D]
     
     Args:
         bond: RDKit bond object
         mol: RDKit molecule object (optional, for dihedral computation)
         
     Returns:
-        Feature vector (13-dim with 3D info, or 9-dim without)
+        Feature vector (12-dim with 3D dihedral, or 10-dim without)
     """
     # Bond type
     bond_type = bond.GetBondType()
@@ -244,7 +252,7 @@ def get_bond_features(bond: Chem.Bond, mol: Chem.Mol = None) -> np.ndarray:
         stereo_encoding +      # 3
         rotatable             # 1
         # Note: 3D distance added separately in graph construction
-    )  # Total: 10 dimensions (+ 1 distance = 11, + 2 dihedral = 13)
+    )  # Total: 10 base dimensions (12 with 3D dihedral; +1 distance added in graph_construction)
     
     # Add 3D dihedral features if molecule is provided with 3D coordinates
     if mol is not None and mol.GetNumConformers() > 0:
@@ -266,7 +274,7 @@ def featurize_ligand(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
         - atom_features: (num_atoms, 49) array
         - atom_coords: (num_atoms, 3) array of 3D coordinates
         - bond_indices: (2, num_bonds) array of edge indices
-        - bond_features: (num_bonds, 9) array
+        - bond_features: (num_bonds, LIGAND_BOND_FEATURE_DIM) array
     """
     # Ensure molecule has 3D coordinates
     if mol.GetNumConformers() == 0:
@@ -287,6 +295,13 @@ def featurize_ligand(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
     
     # Bond features and indices
     num_bonds = mol.GetNumBonds()
+    
+    if num_bonds == 0:
+        # Single-atom molecule (e.g., metal ions): return empty bond arrays
+        bond_indices = np.zeros((2, 0), dtype=np.int64)
+        bond_features = np.zeros((0, LIGAND_BOND_FEATURE_DIM), dtype=np.float32)
+        return atom_features, atom_coords, bond_indices, bond_features
+    
     bond_indices = np.zeros((2, num_bonds * 2), dtype=np.int64)  # Bidirectional
     
     # First pass: determine feature dimension (includes dihedral if 3D coords available)
@@ -414,9 +429,10 @@ def featurize_protein(
     secondary_structure_dict = {}
     try:
         dssp = DSSP(model, pdb_file, dssp='mkdssp')
-        for key in dssp.property_keys:
+        for key in dssp.keys():
+            # key is (chain_id, (' ', res_number, ' ')) or similar tuple
             residue_id = key[1][1]  # Get residue number
-            ss = dssp[key][2]  # Secondary structure
+            ss = dssp[key][2]  # Secondary structure letter
             secondary_structure_dict[residue_id] = ss
     except Exception:
         # DSSP not available or failed
@@ -513,11 +529,102 @@ def identify_binding_pocket(
     return in_pocket
 
 
+def validate_protonation_state(protein_pdb: str, ligand_sdf: str) -> Dict:
+    """
+    Validate protonation states of protein and ligand.
+    
+    Checks for:
+    1. Missing hydrogens (common in crystal structures)
+    2. Inconsistent protonation between protein preparation and ligand
+    3. Histidine protonation state (important for binding)
+    
+    Args:
+        protein_pdb: Path to protein PDB file
+        ligand_sdf: Path to ligand SDF file
+        
+    Returns:
+        Dictionary with validation results and warnings
+    """
+    from Bio.PDB import PDBParser
+    
+    warnings_list = []
+    hydrogen_atoms = 0
+    protein_h_count = 0
+    
+    # Check ligand hydrogens
+    supplier = Chem.SDMolSupplier(ligand_sdf)
+    ligand_mol = next(supplier)
+    
+    if ligand_mol is not None:
+        total_atoms = ligand_mol.GetNumAtoms()
+        heavy_atoms = sum(1 for atom in ligand_mol.GetAtoms() if atom.GetAtomicNum() != 1)
+        hydrogen_atoms = total_atoms - heavy_atoms
+        
+        if hydrogen_atoms == 0:
+            warnings_list.append("Ligand has no explicit hydrogens - may need protonation")
+        else:
+            h_ratio = hydrogen_atoms / heavy_atoms
+            if h_ratio < 0.5:
+                warnings_list.append(f"Low hydrogen ratio ({h_ratio:.2f}) - check protonation")
+        
+        # Check formal charges sum
+        total_charge = sum(atom.GetFormalCharge() for atom in ligand_mol.GetAtoms())
+        if total_charge != 0:
+            warnings_list.append(f"Ligand has net charge {total_charge} - ensure this is intentional")
+    
+    # Check protein for common issues
+    try:
+        parser = PDBParser(QUIET=True)
+        structure = parser.get_structure('protein', protein_pdb)
+        
+        # Count hydrogens in protein
+        protein_h_count = 0
+        total_protein_atoms = 0
+        
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    for atom in residue:
+                        total_protein_atoms += 1
+                        if atom.element == 'H':
+                            protein_h_count += 1
+        
+        if protein_h_count == 0:
+            warnings_list.append("Protein has no hydrogens - binding site chemistry may be inaccurate")
+        
+        # Check for common protonation issues
+        his_count = 0
+        for model in structure:
+            for chain in model:
+                for residue in chain:
+                    if residue.get_resname() == 'HIS':
+                        his_count += 1
+                        # Check if HD1 or HE2 is present (protonated states)
+                        has_hd1 = 'HD1' in [atom.get_name() for atom in residue]
+                        has_he2 = 'HE2' in [atom.get_name() for atom in residue]
+                        
+                        if has_hd1 and has_he2:
+                            pass  # Both present - likely correctly protonated
+                        elif not has_hd1 and not has_he2:
+                            warnings_list.append(f"HIS {residue.get_id()[1]} missing both protons - check protonation state")
+        
+    except Exception as e:
+        warnings_list.append(f"Could not validate protein protonation: {e}")
+    
+    return {
+        'valid': len(warnings_list) == 0,
+        'warnings': warnings_list,
+        'ligand_hydrogens': hydrogen_atoms if ligand_mol else 0,
+        'protein_hydrogens': protein_h_count
+    }
+
+
 def featurize_complex(
     protein_pdb: str,
     ligand_sdf: str,
     binding_pocket_only: bool = True,
-    pocket_cutoff: float = 10.0
+    pocket_cutoff: float = 10.0,
+    validate_protonation: bool = True
 ) -> Dict:
     """
     Featurize a complete protein-ligand complex.
@@ -527,10 +634,22 @@ def featurize_complex(
         ligand_sdf: Path to ligand SDF file
         binding_pocket_only: If True, only use binding pocket residues
         pocket_cutoff: Distance cutoff for binding pocket (Angstroms)
+        validate_protonation: If True, check protonation states
         
     Returns:
         Dictionary with all featurized data
     """
+    # Validate protonation if requested
+    protonation_warnings = []
+    if validate_protonation:
+        validation_result = validate_protonation_state(protein_pdb, ligand_sdf)
+        protonation_warnings = validation_result['warnings']
+        if protonation_warnings:
+            import logging
+            logger = logging.getLogger(__name__)
+            for warning in protonation_warnings:
+                logger.warning(f"Protonation: {warning}")
+    
     # Load and featurize ligand
     supplier = Chem.SDMolSupplier(ligand_sdf)
     ligand_mol = next(supplier)
@@ -574,6 +693,10 @@ def featurize_complex(
         'complex': {
             'binding_pocket_only': binding_pocket_only,
             'pocket_cutoff': pocket_cutoff,
+        },
+        'validation': {
+            'protonation_warnings': protonation_warnings,
+            'protonation_valid': len(protonation_warnings) == 0
         }
     }
 

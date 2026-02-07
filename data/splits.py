@@ -3,12 +3,17 @@ Data Splitting Module for Leak-Proof PDBBind (LP-PDBBind)
 
 Implements scientifically rigorous data splitting to prevent information leakage.
 
+Key Features:
+- MMseqs2 integration for accurate protein sequence clustering (30% identity)
+- RDKit Morgan fingerprints for ligand similarity (50% Tanimoto)
+- Scaffold-based splitting for ligand generalization assessment
+- Comprehensive audit trail for all similarity computations
+
 Citation:
     Li et al. (2023) "Leak Proof PDBBind: A Non-Leaky Benchmark for Binding Affinity 
     Prediction" arXiv:2308.09639
     
-    Key motivation: Traditional PDBBind splits have protein sequence similarity up to 99.6%
-    between train/test, causing inflated performance metrics.
+    Steinegger & Söding (2017) "MMseqs2 enables sensitive protein sequence searching"
 """
 
 import logging
@@ -17,6 +22,8 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Optional
 from rdkit import Chem
 from rdkit.Chem import AllChem, DataStructs
+
+from .mmseqs2_wrapper import run_mmseqs2_clustering
 
 logger = logging.getLogger(__name__)
 
@@ -71,13 +78,22 @@ def compute_sequence_similarity(seq1: str, seq2: str, method: str = 'identity') 
         return 0.0
     
     if method == 'identity':
-        # Simple Hamming-based identity (requires same length)
-        if len(seq1) != len(seq2):
-            # Use alignment-based approach
+        try:
+            from Bio.Align import PairwiseAligner
+            aligner = PairwiseAligner()
+            aligner.mode = 'global'
+            aligner.match_score = 1.0
+            aligner.mismatch_score = 0.0
+            aligner.open_gap_score = -0.5
+            aligner.extend_gap_score = -0.1
+            alignments = aligner.align(seq1, seq2)
+            if alignments:
+                return alignments[0].score / max(len(seq1), len(seq2))
+            return 0.0
+        except ImportError:
+            # Fallback: simple character matching (less accurate for unequal lengths)
             matches = sum(1 for a, b in zip(seq1, seq2) if a == b)
             return matches / max(len(seq1), len(seq2))
-        else:
-            return sum(1 for a, b in zip(seq1, seq2) if a == b) / len(seq1)
     else:
         raise ValueError(f"Unknown method: {method}")
 
@@ -188,12 +204,40 @@ def create_lp_pdbbind_splits(
     
     logger.info(f"Successfully loaded {len(valid_complexes)} valid complexes")
     
-    # Build similarity matrix (simplified version)
-    # Production code would use MMseqs2 for faster computation
-    n = len(valid_complexes)
-    seq_sim_matrix = np.eye(n)  # Diagonal is 1.0 (self-similarity)
+    # Use MMseqs2 for sequence clustering at 30% identity threshold
+    logger.info("Running MMseqs2 for sequence clustering...")
+    seq_clusters = run_mmseqs2_clustering(
+        sequences, 
+        output_dir / 'mmseqs2',
+        seq_id_threshold=protein_seq_cutoff
+    )
     
-    logger.info("Computing pairwise similarities (this may take a while)...")
+    # Build cluster membership matrix for sequences
+    # Two sequences are similar if they're in the same MMseqs2 cluster
+    n = len(valid_complexes)
+    pdb_id_to_idx = {c['pdb_id']: i for i, c in enumerate(valid_complexes)}
+    seq_sim_matrix = np.zeros((n, n))
+    
+    for i in range(n):
+        pdb_i = valid_complexes[i]['pdb_id']
+        cluster_i = seq_clusters.get(pdb_i, -1)
+        for j in range(i, n):
+            pdb_j = valid_complexes[j]['pdb_id']
+            cluster_j = seq_clusters.get(pdb_j, -1)
+            # Same cluster = similar sequences
+            if cluster_i != -1 and cluster_i == cluster_j:
+                seq_sim_matrix[i, j] = 1.0
+                seq_sim_matrix[j, i] = 1.0
+            elif i == j:
+                seq_sim_matrix[i, j] = 1.0
+    
+    logger.info(f"MMseqs2 created {len(set(seq_clusters.values()))} sequence clusters")
+    
+    # Initialize ligand similarity matrix
+    ligand_sim_matrix = np.zeros((n, n))
+    
+    # Build ligand similarity matrix using Morgan fingerprints
+    logger.info("Computing ligand similarities...")
     for i in range(n):
         if i % max(1, n // 10) == 0:
             logger.info(f"  Progress: {i}/{n}")
@@ -207,46 +251,82 @@ def create_lp_pdbbind_splits(
             seq_j = sequences.get(pdb_j, "")
             mol_j = ligands.get(pdb_j)
             
-            # Compute sequence similarity
-            seq_sim = compute_sequence_similarity(seq_i, seq_j) if seq_i and seq_j else 0.0
-            seq_sim_matrix[i, j] = seq_sim
-            seq_sim_matrix[j, i] = seq_sim
+            # Compute sequence similarity (already done via MMseqs2 clusters)
+            seq_sim = seq_sim_matrix[i, j]
             
-            # Ligand similarity would be computed similarly
-            # For now, simplified
+            # Compute ligand similarity using Morgan fingerprints
+            if mol_i is not None and mol_j is not None:
+                ligand_sim = compute_ligand_similarity(mol_i, mol_j, metric='tanimoto')
+            else:
+                ligand_sim = 0.0
+            ligand_sim_matrix[i, j] = ligand_sim
+            ligand_sim_matrix[j, i] = ligand_sim
     
-    # Greedy algorithm to partition into clusters with no high-similarity pairs between clusters
-    # This is a simplified version of LP-PDBBind's iterative approach
-    clusters = []  # Each cluster is a list of indices
-    used = set()
+    # Save similarity audit log for reproducibility verification
+    audit_file = output_dir / 'similarity_audit.txt'
+    with open(audit_file, 'w') as f:
+        f.write(f"# LP-PDBBind Split Audit\n")
+        f.write(f"# Random seed: {random_seed}\n")
+        f.write(f"# Protein sequence cutoff: {protein_seq_cutoff}\n")
+        f.write(f"# Ligand similarity cutoff: {ligand_sim_cutoff}\n\n")
+        f.write(f"MMseqs2 sequence clusters: {len(set(seq_clusters.values()))}\n")
+        f.write(f"Total complexes: {n}\n\n")
+        f.write("# Per-cluster complex counts:\n")
+        from collections import Counter
+        cluster_counts = Counter(seq_clusters.values())
+        for cluster_id, count in sorted(cluster_counts.items()):
+            f.write(f"  Cluster {cluster_id}: {count} complexes\n")
+    logger.info(f"Similarity audit log saved to {audit_file}")
+    logger.info(f"  Ligand similarities: min={ligand_sim_matrix.min():.3f}, max={ligand_sim_matrix.max():.3f}")
     
+    # Build similarity graph: edge exists if complexes are similar (above threshold)
+    # Two complexes are similar if: seq_sim > cutoff OR ligand_sim > cutoff
+    logger.info("Building similarity graph for leak-proof clustering...")
+    
+    # Use Union-Find (Disjoint Set Union) for efficient connected components
+    parent = list(range(n))
+    rank = [0] * n
+    
+    def find(x):
+        if parent[x] != x:
+            parent[x] = find(parent[x])  # Path compression
+        return parent[x]
+    
+    def union(x, y):
+        px, py = find(x), find(y)
+        if px == py:
+            return
+        if rank[px] < rank[py]:
+            px, py = py, px
+        parent[py] = px
+        if rank[px] == rank[py]:
+            rank[px] += 1
+    
+    # Connect similar complexes
+    similarity_edges = 0
     for i in range(n):
-        if i in used:
-            continue
-        
-        # Start a new cluster with i
-        cluster = [i]
-        used.add(i)
-        
-        # Add nodes that don't have high similarity to any node in cluster
-        for j in range(n):
-            if j in used:
-                continue
+        for j in range(i + 1, n):
+            # Check if similar by sequence
+            is_similar = seq_sim_matrix[i, j] > protein_seq_cutoff
+            # Check if similar by ligand
+            is_similar = is_similar or (ligand_sim_matrix[i, j] > ligand_sim_cutoff)
             
-            # Check if j is similar to any node in cluster
-            is_similar = False
-            for k in cluster:
-                if seq_sim_matrix[j, k] > protein_seq_cutoff:
-                    is_similar = True
-                    break
-            
-            if not is_similar:
-                cluster.append(j)
-                used.add(j)
-        
-        clusters.append(cluster)
+            if is_similar:
+                union(i, j)
+                similarity_edges += 1
     
-    logger.info(f"Created {len(clusters)} clusters (groups of non-similar complexes)")
+    logger.info(f"Found {similarity_edges} similarity edges")
+    
+    # Build clusters from Union-Find structure
+    cluster_map = {}
+    for i in range(n):
+        root = find(i)
+        if root not in cluster_map:
+            cluster_map[root] = []
+        cluster_map[root].append(i)
+    
+    clusters = list(cluster_map.values())
+    logger.info(f"Created {len(clusters)} connected component clusters")
     
     # Distribute clusters to train/val/test
     cluster_indices = np.arange(len(clusters))
@@ -380,6 +460,116 @@ def load_split_indices(
     logger.info(f"Loaded {split_name} split: {len(indices)} samples")
     
     return indices
+
+
+def create_scaffold_split(
+    data_dir: str,
+    index_file: str,
+    output_dir: str,
+    test_fraction: float = 0.1,
+    val_fraction: float = 0.1,
+    random_seed: int = 42
+) -> Dict[str, str]:
+    """
+    Create scaffold-based train/val/test splits for ligand generalization.
+    
+    Scaffold splitting ensures models generalize to novel chemical structures
+    rather than memorizing substituent patterns.
+    
+    Args:
+        data_dir: Directory containing PDB/SDF files
+        index_file: File with [pdb_id, affinity] pairs
+        output_dir: Directory to save split files
+        test_fraction: Fraction for test
+        val_fraction: Fraction for validation
+        random_seed: Random seed
+        
+    Returns:
+        Dictionary with paths to split files
+    """
+    import random
+    from collections import defaultdict
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+    
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    
+    data_dir = Path(data_dir)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    logger.info("Creating scaffold-based splits")
+    
+    # Load complexes and extract scaffolds
+    complexes = []
+    scaffold_to_complexes = defaultdict(list)
+    
+    with open(index_file, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                pdb_id = parts[0]
+                affinity = float(parts[1])
+                
+                # Load ligand and extract scaffold
+                sdf_path = data_dir / pdb_id / f"{pdb_id}_ligand.sdf"
+                try:
+                    mol = Chem.SDMolSupplier(str(sdf_path))[0]
+                    if mol is not None:
+                        scaffold = MurckoScaffold.GetScaffoldForMol(mol)
+                        scaffold_smiles = Chem.MolToSmiles(scaffold) if scaffold else ""
+                    else:
+                        scaffold_smiles = ""
+                except Exception:
+                    scaffold_smiles = ""
+                
+                complex_data = {'pdb_id': pdb_id, 'affinity': affinity, 'scaffold': scaffold_smiles}
+                complexes.append(complex_data)
+                scaffold_to_complexes[scaffold_smiles].append(complex_data)
+    
+    logger.info(f"Loaded {len(complexes)} complexes with {len(scaffold_to_complexes)} unique scaffolds")
+    
+    # Split scaffolds (not individual complexes)
+    scaffolds = list(scaffold_to_complexes.keys())
+    np.random.shuffle(scaffolds)
+    
+    num_test = max(1, int(len(scaffolds) * test_fraction))
+    num_val = max(1, int(len(scaffolds) * val_fraction))
+    
+    test_scaffolds = set(scaffolds[:num_test])
+    val_scaffolds = set(scaffolds[num_test:num_test + num_val])
+    train_scaffolds = set(scaffolds[num_test + num_val:])
+    
+    # Assign complexes based on scaffold membership
+    train_complexes = []
+    val_complexes = []
+    test_complexes = []
+    
+    for c in complexes:
+        if c['scaffold'] in test_scaffolds:
+            test_complexes.append(c)
+        elif c['scaffold'] in val_scaffolds:
+            val_complexes.append(c)
+        else:
+            train_complexes.append(c)
+    
+    # Write split files
+    def write_split(complex_list, filename):
+        path = output_dir / filename
+        with open(path, 'w') as f:
+            for c in complex_list:
+                f.write(f"{c['pdb_id']} {c['affinity']:.2f}\n")
+        logger.info(f"Wrote {len(complex_list)} complexes to {path}")
+        return str(path)
+    
+    result = {
+        'train': write_split(train_complexes, "train_scaffold.txt"),
+        'val': write_split(val_complexes, "val_scaffold.txt"),
+        'test': write_split(test_complexes, "test_scaffold.txt")
+    }
+    
+    logger.info(f"✓ Scaffold splits: Train={len(train_complexes)}, Val={len(val_complexes)}, Test={len(test_complexes)}")
+    return result
 
 
 if __name__ == "__main__":
