@@ -243,28 +243,33 @@ class TestDatasetValidation:
         assert hasattr(ProteinLigandDataset, '_validate_files'), \
             "Dataset should have _validate_files method"
     
-    def test_dataset_validation_checks_files(self):
-        """Test that validation checks file existence and readability."""
+    def test_dataset_validation_filters_missing_files(self):
+        """Test that validation filters out entries with missing/invalid files."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create mock index file
-            index_file = Path(tmpdir) / "index.csv"
-            index_file.write_text("pdb_id,affinity\n1abc,7.5\n")
+            # Create index file in expected format (space-separated: pdb_id affinity)
+            index_file = Path(tmpdir) / "index.txt"
+            index_file.write_text("1abc 7.5\n2def 6.0\n")
             
-            # Create mock data files
+            # Create data directory structure for 1abc but NOT for 2def
+            # This tests that validation correctly filters missing entries
             data_dir = Path(tmpdir) / "data"
-            data_dir.mkdir()
+            pdb_dir = data_dir / "1abc"
+            pdb_dir.mkdir(parents=True)
             
-            pdb_file = data_dir / "1abc.pdb"
-            pdb_file.write_text("MOCK PDB FILE")
+            # Create placeholder files (they won't parse, but _validate_files
+            # should filter them out gracefully)
+            (pdb_dir / "1abc_protein.pdb").write_text("MOCK")
+            (pdb_dir / "1abc_ligand.sdf").write_text("MOCK")
             
-            sdf_file = data_dir / "1abc.sdf"
-            sdf_file.write_text("MOCK SDF FILE")
+            # Dataset should load 2 entries from index, then validation
+            # should filter both out (1abc has unparseable files, 2def is missing)
+            dataset = ProteinLigandDataset(
+                str(data_dir), str(index_file), use_cache=False
+            )
             
-            # Create dataset
-            dataset = ProteinLigandDataset(str(data_dir), str(index_file))
-            
-            # Validation should pass
-            assert len(dataset.data_list) == 1, "Should have one valid complex"
+            # Both should be filtered: 2def missing files, 1abc unparseable
+            assert len(dataset.data_list) == 0, \
+                "Invalid/missing files should be filtered by validation"
 
 
 class TestSetSeedCentralization:

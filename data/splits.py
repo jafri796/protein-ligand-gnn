@@ -172,7 +172,6 @@ def create_lp_pdbbind_splits(
             # Load protein sequence
             structure = pdb_parser.get_structure(pdb_id, str(pdb_path))
             from Bio.Seq import Seq
-            from Bio.SeqUtils import IUPACData
             
             # Extract sequence from first model/chain
             ppb = None
@@ -185,7 +184,7 @@ def create_lp_pdbbind_splits(
                 else:
                     logger.warning(f"No peptides found in {pdb_id}")
                     seq = ""
-            except:
+            except Exception:
                 seq = ""
             
             sequences[pdb_id] = seq

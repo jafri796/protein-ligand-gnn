@@ -22,7 +22,7 @@ import argparse
 from tqdm import tqdm
 import numpy as np
 from scipy.stats import pearsonr, spearmanr
-from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import logging
 
 # Add parent directory to path
@@ -74,11 +74,20 @@ def compute_metrics(predictions, targets):
     except Exception as e:
         logger.warning(f"Spearman correlation computation failed: {e}")
     
+    # R² score
+    r2 = np.nan
+    try:
+        if len(np.unique(targets)) > 1:
+            r2 = r2_score(targets, predictions)
+    except Exception as e:
+        logger.warning(f"R² computation failed: {e}")
+
     return {
         'rmse': rmse,
         'mae': mae,
         'pearson': pearson,
-        'spearman': spearman
+        'spearman': spearman,
+        'r2': r2
     }
 
 

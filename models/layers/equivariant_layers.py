@@ -171,7 +171,6 @@ class PaiNNUpdate(nn.Module):
         
         # Update networks
         self.update_U = nn.Linear(hidden_dim, hidden_dim)
-        self.update_V = nn.Linear(hidden_dim, hidden_dim)
         
         # Mixing networks
         self.mix_net = nn.Sequential(
@@ -264,11 +263,14 @@ class InteractionLayer(MessagePassing):
     - EquiBind (Stärk et al., 2022)
     """
     
-    def __init__(self, hidden_dim: int, num_heads: int = 4, edge_dim: int = 14):
+    def __init__(self, hidden_dim: int, num_heads: int = 4, edge_dim: int = 14,
+                 vector_weight: float = 0.3, edge_weight: float = 0.3):
         super().__init__(aggr='add')
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.vector_weight = vector_weight
+        self.edge_weight = edge_weight
         
         assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
         
@@ -341,7 +343,7 @@ class InteractionLayer(MessagePassing):
         edge_contrib = (edge_emb * q).sum(dim=-1) / math.sqrt(self.head_dim)
         
         # Combine all contributions
-        attn = attn_qk + 0.3 * attn_v + 0.3 * edge_contrib
+        attn = attn_qk + self.vector_weight * attn_v + self.edge_weight * edge_contrib
         
         # Softmax normalization
         attn = softmax(attn, index, dim=0)

@@ -141,13 +141,14 @@ class DistributedTrainer:
                 weight_decay=self.config['training']['weight_decay']
             )
             
-            # Scheduler
+            # Scheduler (use config values with sensible defaults)
+            lr_sched_cfg = self.config.get('training', {}).get('lr_scheduler', {})
             self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
-                factor=0.5,
-                patience=5,
-                min_lr=1e-6,
+                factor=lr_sched_cfg.get('factor', 0.5),
+                patience=lr_sched_cfg.get('patience', 10),
+                min_lr=lr_sched_cfg.get('min_lr', 1e-6),
                 verbose=self.is_main
             )
             
@@ -191,7 +192,7 @@ class DistributedTrainer:
                     self.optimizer.zero_grad()
                     
                     if self.scaler is not None:
-                        with autocast():
+                        with autocast(device_type='cuda'):
                             pred = self.model(batch)
                             loss = self.criterion(pred.view(-1), batch.y.view(-1))
                         

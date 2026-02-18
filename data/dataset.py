@@ -78,7 +78,11 @@ class ProteinLigandDataset(Dataset):
         # Validate files
         self._validate_files()
         
-        # Target statistics for optional normalization (train stats can be reused)
+        # Target statistics (computed from this split's affinities).
+        # For val/test datasets, pass target_stats from the training set via
+        # get_target_stats() to avoid information leakage through normalization.
+        # NOTE: these stats are NOT applied to graph.y — they are stored for
+        # optional downstream use (e.g., standardized targets).
         if target_stats and {'mean', 'std'} <= target_stats.keys():
             self.target_mean = float(target_stats['mean'])
             self.target_std = float(max(target_stats['std'], 1e-8))

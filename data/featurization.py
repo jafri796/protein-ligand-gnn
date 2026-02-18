@@ -34,15 +34,15 @@ def get_atom_features(atom: Chem.Atom) -> np.ndarray:
     Extract atom features following GraphDTA and IGN conventions.
     
     Features (49-dimensional):
-    - Atomic number (1-hot, 44 common atoms)
-    - Degree (1-hot, 0-5) — 6 dims
-    - Formal charge (1-hot, -2 to +2) — 5 dims
+    - Atom type (1-hot, 19 common atoms + 1 other) — 20 dims
+    - Degree (1-hot, 0-5 + 6+) — 7 dims
+    - Formal charge (1-hot, -2 to +2 + other) — 6 dims
     - Hybridization (1-hot, SP, SP2, SP3, SP3D, SP3D2) — 5 dims
     - Aromaticity (binary) — 1 dim
-    - Number of hydrogen atoms (1-hot, 0-4) — 5 dims
+    - Number of hydrogen atoms (1-hot, 0-4 + 5+) — 6 dims
     - Chirality (1-hot, R, S, unspecified) — 3 dims
     - Is in ring (binary) — 1 dim
-    Total: 44 + 6 + 5 + 5 + 1 + 5 + 3 + 1 = 70 → actual 49 after compact encoding
+    Total: 20 + 7 + 6 + 5 + 1 + 6 + 3 + 1 = 49
     
     Justification:
     - Duvenaud et al. (2015) Neural Fingerprints
@@ -439,9 +439,14 @@ def featurize_protein(
             residue_id = key[1][1]  # Get residue number
             ss = dssp[key][2]  # Secondary structure letter
             secondary_structure_dict[residue_id] = ss
-    except Exception:
-        # DSSP not available or failed
-        pass
+    except Exception as e:
+        # DSSP not available or failed — secondary structure features will be zero vectors
+        import logging
+        logging.getLogger(__name__).warning(
+            f"DSSP unavailable for {pdb_file}: {e}. "
+            "Secondary structure features will default to zeros. "
+            "Install mkdssp for accurate secondary structure annotation."
+        )
     
     # Extract residues with terminus detection
     residues = []
