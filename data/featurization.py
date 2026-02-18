@@ -204,7 +204,7 @@ def get_bond_features(bond: Chem.Bond, mol: Chem.Mol = None) -> np.ndarray:
     """
     Extract bond features.
     
-    Features (10-dimensional base, 12 with 3D dihedral):
+    Features (12-dimensional with 3D dihedral, padded if missing):
     - Bond type (1-hot: single, double, triple, aromatic) - 4 dims
     - Conjugation (binary) - 1 dim
     - Is in ring (binary) - 1 dim
@@ -217,7 +217,7 @@ def get_bond_features(bond: Chem.Bond, mol: Chem.Mol = None) -> np.ndarray:
         mol: RDKit molecule object (optional, for dihedral computation)
         
     Returns:
-        Feature vector (12-dim with 3D dihedral, or 10-dim without)
+        Feature vector (12-dim)
     """
     # Bond type
     bond_type = bond.GetBondType()
@@ -258,6 +258,12 @@ def get_bond_features(bond: Chem.Bond, mol: Chem.Mol = None) -> np.ndarray:
     if mol is not None and mol.GetNumConformers() > 0:
         dihedral = get_dihedral_angle(mol, bond)
         features = np.append(features, [np.sin(dihedral), np.cos(dihedral)])
+    
+    # Pad to LIGAND_BOND_FEATURE_DIM if necessary
+    if len(features) < LIGAND_BOND_FEATURE_DIM:
+        features = np.pad(features, (0, LIGAND_BOND_FEATURE_DIM - len(features)))
+    elif len(features) > LIGAND_BOND_FEATURE_DIM:
+        features = features[:LIGAND_BOND_FEATURE_DIM]
     
     return np.array(features, dtype=np.float32)
 
@@ -303,12 +309,7 @@ def featurize_ligand(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
         return atom_features, atom_coords, bond_indices, bond_features
     
     bond_indices = np.zeros((2, num_bonds * 2), dtype=np.int64)  # Bidirectional
-    
-    # First pass: determine feature dimension (includes dihedral if 3D coords available)
-    first_bond = list(mol.GetBonds())[0]
-    sample_feat = get_bond_features(first_bond, mol)
-    bond_feat_dim = len(sample_feat)
-    bond_features = np.zeros((num_bonds * 2, bond_feat_dim), dtype=np.float32)
+    bond_features = np.zeros((num_bonds * 2, LIGAND_BOND_FEATURE_DIM), dtype=np.float32)
     
     for i, bond in enumerate(mol.GetBonds()):
         start_idx = bond.GetBeginAtomIdx()
@@ -321,6 +322,10 @@ def featurize_ligand(mol: Chem.Mol) -> Tuple[np.ndarray, np.ndarray, np.ndarray,
         bond_indices[1, 2*i+1] = start_idx
         
         bond_feat = get_bond_features(bond, mol)  # Pass molecule for 3D features
+        if bond_feat.shape[0] < LIGAND_BOND_FEATURE_DIM:
+            bond_feat = np.pad(bond_feat, (0, LIGAND_BOND_FEATURE_DIM - bond_feat.shape[0]))
+        elif bond_feat.shape[0] > LIGAND_BOND_FEATURE_DIM:
+            bond_feat = bond_feat[:LIGAND_BOND_FEATURE_DIM]
         bond_features[2*i] = bond_feat
         bond_features[2*i+1] = bond_feat
     

@@ -142,13 +142,13 @@ with torch.no_grad():
 
 **Molecular Feature Extraction**
 
-- **Ligand Features**: RDKit-based atom features (49-dim) and bond features (10-dim)
-  - Atom type, degree, formal charge, hybridization, aromaticity, etc.
-  - Bond type, conjugation, ring membership, stereo configuration
+- **Ligand Features**: RDKit-based atom features (49-dim) and bond features (12-dim)
+  - Atom type, degree, formal charge, hybridization, aromaticity, chirality, etc.
+  - Bond type, conjugation, ring membership, stereo configuration, rotatability, dihedral sine/cosine
   
 - **Protein Features**: BioPython residue features (31-dim)
-  - Amino acid type, secondary structure (alpha-helix, beta-sheet, coil)
-  - Backbone angles, accessibility, charge properties
+  - Amino acid type (one-hot), DSSP secondary structure, N/C-terminus flags
+  - Cα coordinates retained for geometric modeling (distance + direction features)
   
 - **3D Geometry**: Atomic coordinates, pairwise distances, directional vectors
 

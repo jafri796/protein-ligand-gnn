@@ -42,6 +42,7 @@ class ProteinLigandDataset(Dataset):
         interaction_cutoff: Distance cutoff for interactions (Angstroms)
         transform: Optional transform to apply to graphs
         use_cache: Whether to use cached processed data
+        target_stats: Optional target statistics for consistent normalization
     """
     
     def __init__(
@@ -53,7 +54,8 @@ class ProteinLigandDataset(Dataset):
         pocket_cutoff: float = 10.0,
         interaction_cutoff: float = 5.0,
         transform: Optional[Callable] = None,
-        use_cache: bool = True
+        use_cache: bool = True,
+        target_stats: Optional[Dict[str, float]] = None,
     ):
         self.data_dir = Path(data_dir)
         self.index_file = Path(index_file)
@@ -63,6 +65,7 @@ class ProteinLigandDataset(Dataset):
         self.interaction_cutoff = interaction_cutoff
         self.transform = transform
         self.use_cache = use_cache
+        self.target_stats = target_stats
         
         # Create cache directory if it doesn't exist
         if self.cache_dir and self.use_cache:
@@ -75,15 +78,12 @@ class ProteinLigandDataset(Dataset):
         # Validate files
         self._validate_files()
         
-        # Compute target statistics for optional normalization
-        affinities = [item['affinity'] for item in self.data_list]
-        if affinities:
-            self.target_mean = float(np.mean(affinities))
-            self.target_std = float(np.std(affinities)) if len(affinities) > 1 else 1.0
-            logger.info(f"Target stats: mean={self.target_mean:.3f}, std={self.target_std:.3f}")
+        # Target statistics for optional normalization (train stats can be reused)
+        if target_stats and {'mean', 'std'} <= target_stats.keys():
+            self.target_mean = float(target_stats['mean'])
+            self.target_std = float(max(target_stats['std'], 1e-8))
         else:
-            self.target_mean = 0.0
-            self.target_std = 1.0
+            self._compute_target_stats()
     
     def _load_index(self) -> List[Dict]:
         """Load index file with PDB IDs and affinities."""
@@ -153,6 +153,21 @@ class ProteinLigandDataset(Dataset):
         # Keep only valid entries
         self.data_list = [self.data_list[i] for i in valid_indices]
         logger.info(f"Validated {len(self.data_list)} complexes with complete files")
+    
+    def _compute_target_stats(self):
+        affinities = [item['affinity'] for item in self.data_list]
+        if affinities:
+            self.target_mean = float(np.mean(affinities))
+            std = float(np.std(affinities)) if len(affinities) > 1 else 1.0
+            self.target_std = std if std > 0 else 1.0
+            logger.info(f"Target stats: mean={self.target_mean:.3f}, std={self.target_std:.3f}")
+        else:
+            self.target_mean = 0.0
+            self.target_std = 1.0
+    
+    def get_target_stats(self) -> Dict[str, float]:
+        """Return target statistics for sharing across dataset splits."""
+        return {'mean': self.target_mean, 'std': self.target_std}
     
     def _get_cache_path(self, pdb_id: str) -> Path:
         """Get cache file path for a PDB ID."""
